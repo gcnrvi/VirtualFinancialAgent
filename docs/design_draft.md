@@ -1,4 +1,4 @@
-# 설계 초안 (v0.3) — 가상 금융 업무 에이전트
+# 설계 초안 (v0.4) — 가상 금융 업무 에이전트
 
 > 전체 업무(계좌·이체, 카드, 청구서·납부, 공통 대화·처리)를 하나의 뼈대로 설계한다.
 > 구현은 9절의 단계 순서로 진행하며, 단계마다 이 문서를 갱신한다.
@@ -28,8 +28,10 @@ flowchart TD
     lookup --> respond[respond<br/>결과 안내·State 정리]
 
     resolve -->|정보 부족 / 후보 여러 개 / 참조 불확실| ask[ask_user<br/>interrupt: 추가 질문·선택]
-    ask --> parse
+    ask -->|답변을 slots에 병합| resolve
+    ask -->|사용자가 중단| respond
     resolve -->|검증 실패| respond
+    resolve -->|승인 전 수정이 검증 실패<br/>기존 처리안 복구| confirm
     resolve -->|검증 통과| record[create_request<br/>requests: pending_approval]
     record --> confirm[confirm<br/>interrupt: 처리안 제시<br/>LLM: 응답 분류]
 
@@ -136,7 +138,12 @@ class BankState(TypedDict, total=False):
     user_id: str                  # 현재 사용자 (user-001 고정)
     today: str                    # 기준일 YYYY-MM-DD
     intent: str                   # 현재 업무의 intent
-    draft: dict                   # 슬롯 → ID로 해석된 처리안
+    slots: dict                   # LLM이 추출한 값 (별명·금액, 후보를 고르면 *_id)
+    slots_backup: dict | None     # 승인 전 수정 직전의 slots (수정이 실패하면 복구)
+    draft: dict                   # slots를 ID로 해석한 처리안
+    step: str | None              # 직전 노드의 결과 (ok | ask | fail | cancel | revert), 분기에 사용
+    question: str | None          # 추가 질문 문장
+    notice: str | None            # 승인 질문 앞에 덧붙일 안내 (수정 실패, 판단 불가)
     missing: list[str]            # 부족한 슬롯 이름
     candidates: list[dict]        # 선택이 필요한 후보 (계좌·카드·신청·요청)
     plan: str | None              # 사용자에게 보여준 처리안 문장
@@ -347,3 +354,10 @@ class BankState(TypedDict, total=False):
 | v0.3 | `execute → confirm` 경로 추가 | 조건부 이체의 금액이 실행 직전에 바뀌면 재승인 |
 | v0.3 | 상대 날짜를 LLM이 `period`로만 분류하고 Python이 계산 | LLM 날짜 계산 오류 방지 |
 | v0.3 | 테스트 시드 파일과 저장 실패 주입 스위치 추가 | 제작 중 수정 불가, 저장 실패 시나리오 재현 |
+| v0.4 | `ask_user` 다음 노드를 `parse_request`에서 `resolve`로 변경. 답변은 `SlotAnswer` 스키마로 해석해 기존 값에 병합 | `parse_request`로 돌아가면 새 요청으로 처리되어 앞서 받은 값이 초기화됨 |
+| v0.4 | `ask_user`에서 사용자가 중단하면 `respond`로 종료 | "그냥 됐어" 같은 답에서 같은 질문이 반복되지 않게 함 |
+| v0.4 | 승인 전 수정이 검증에 실패하면 `slots_backup`으로 복구하고 `confirm`으로 돌아감 | 잘못된 수정("1억으로") 때문에 진행 중인 요청 전체가 실패하지 않게 함 |
+| v0.4 | `slots`(추출 값)와 `draft`(ID로 해석한 값)를 분리하고 `step`, `question`, `notice` 필드 추가 | 수정·후보 선택 시 원래 표현을 유지하고, 분기 조건을 필드 하나로 판단 |
+| v0.4 | 결과 안내는 LLM 대신 템플릿 문장으로 생성 | 금액·잔액을 틀리게 말할 위험을 없애고 테스트를 쉽게 함 |
+| v0.4 | 계좌 별명 비교 시 공백·'계좌/통장' 무시, 부분 일치는 후보로 확인 | "여행자금", "여행" 같은 표현 처리. 확신할 수 없는 대상은 다시 확인 |
+| v0.4 | Tool 호출 대신 그래프 노드가 `TASKS`를 직접 호출 | 실행 순서(검증 → 승인 → 실행)를 그래프가 보장하도록 함 |
