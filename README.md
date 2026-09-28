@@ -6,7 +6,7 @@ LangGraph로 업무 흐름(해석 → 검증 → 승인 → 실행 → 안내)�
 - LLM: Gemini (`gemini-3.6-flash`) — 요청 해석과 승인 응답 분류에만 사용
 - 대상 확인·검증·데이터 변경: Python 함수
 - 승인 대기·재개: LangGraph `interrupt` + SQLite 체크포인트
-- 설계 자료: [docs/design_draft.md](docs/design_draft.md)
+- 설계 자료: [docs/design_final.md](docs/design_final.md) (최종), [docs/design_draft.md](docs/design_draft.md) (구현 전 초안 v0.3)
 
 ---
 
@@ -23,7 +23,7 @@ uv sync
 cp .env.example .env
 ```
 
-`.env`에 `GEMINI_API_KEY`를 입력합니다. LangSmith 추적은 선택입니다.
+`.env`에 `GEMINI_API_KEY`를 입력합니다.
 
 ### 실행
 
@@ -72,7 +72,9 @@ uv run python src/main.py
 ```text
 VirtualFinancialAgent/
 ├── data/                  # 원본·작업용·테스트 시드 데이터
-├── docs/design_draft.md   # 설계 자료와 변경 이력
+├── docs/
+│   ├── design_draft.md    # 설계 초안 (구현 전, v0.3)
+│   └── design_final.md    # 최종 설계, 초안 대비 변경 내용과 이유
 └── src/
     ├── main.py            # 입력 반복, 승인 응답 연결, 명령 처리, 재시작 복구
     ├── graph.py           # State, LLM 출력 스키마, 공통 노드 9개와 분기
@@ -251,7 +253,7 @@ parse_request ─ 조회 ─→ lookup ─────────────�
 
 ### 5-3. 구현 중 발견한 LLM 동작
 
-슬롯 필드가 늘어난 뒤 LLM이 가끔 업무 종류만 맞히고 슬롯은 모두 비워서 응답했습니다. 예를 들어 "이번 달 생활비 출금 내역"이 전체 기간 조회로 처리됐습니다. 출력 스키마에서 판단 필드(`intent`)가 슬롯 뒤에 있을 때 같은 요청 30회 중 5회 발생했고, 판단 필드를 앞으로 옮긴 뒤에는 0회였습니다. 원인과 수치는 [src/graph.py](src/graph.py)의 스키마 주석과 설계 변경 이력(v0.8)에 기록했습니다.
+슬롯 필드가 늘어난 뒤 LLM이 가끔 업무 종류만 맞히고 슬롯은 모두 비워서 응답했습니다. 예를 들어 "이번 달 생활비 출금 내역"이 전체 기간 조회로 처리됐습니다. 출력 스키마에서 판단 필드(`intent`)가 슬롯 뒤에 있을 때 같은 요청 30회 중 5회 발생했고, 판단 필드를 앞으로 옮긴 뒤에는 0회였습니다. 원인과 수치는 [src/graph.py](src/graph.py)의 스키마 주석과 [최종 설계 10-3절](docs/design_final.md#10-3-llm-스키마)에 기록했습니다.
 
 ---
 

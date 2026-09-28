@@ -167,7 +167,7 @@ class BankState(TypedDict, total=False):
     slots: dict                   # LLM이 추출한 값 (별명·금액, 후보 선택 시 *_id)
     slots_backup: dict | None     # 승인 전 수정 직전의 slots (수정 실패 시 복구)
     draft: dict | None            # ID로 해석된 처리안
-    step: str | None              # 직전 노드의 결과 (ok | ask | fail | cancel | revert)
+    step: str | None              # 직전 노드의 결과 (ok | ask | fail | cancel | revert | skip | changed | next | done)
     question: str | None          # 추가 질문 문장
     candidates: dict | None       # 선택이 필요한 후보 {"slot": ..., "options": [...]}
     plan: str | None              # 승인 질문에 보여줄 처리안
