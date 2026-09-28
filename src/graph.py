@@ -183,6 +183,9 @@ def resolve(state: BankState) -> dict:
             "slots_backup": None,
             "notice": f"그렇게 바꿀 수 없어요. {r['error']} 기존 처리안을 유지할게요.",
         }
+    # 이미 기록된 요청을 다시 검증하다 실패하면(재시작 복구 등) 요청도 실패로 남긴다.
+    if state.get("request_id"):
+        fn.fail_request(state["request_id"], r["error"])
     return {"step": "fail", "error": r["error"]}
 
 

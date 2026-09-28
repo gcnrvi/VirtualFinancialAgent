@@ -184,6 +184,19 @@ def cancel_request(request_id: str) -> dict:
     return {"status": "cancelled", "message": "요청을 취소했어요. 변경된 내용은 없어요."}
 
 
+def fail_request(request_id: str, message: str) -> None:
+    """승인 대기 중 재검증에 실패한 요청을 실패로 기록한다. (재시작 복구 등)"""
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return
+    _set_request_result(request, "failed", message)
+    try:
+        save_data(data)
+    except SaveError:
+        pass  # 데이터 변경은 없으므로 안내만 한다.
+
+
 def _find_request(data: dict, request_id: str) -> dict:
     request = next((r for r in data["requests"] if r["request_id"] == request_id), None)
     if request is None:
