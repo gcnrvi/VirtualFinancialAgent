@@ -1,1 +1,1 @@
-# miniProject3
+# Virtual financial agent
