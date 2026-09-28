@@ -27,7 +27,8 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 import functions as fn
-from data_store import CHECKPOINT_PATH, SaveError, load_data
+import data_store
+from data_store import SaveError, load_data
 
 load_dotenv()
 
@@ -706,5 +707,5 @@ def build_graph(checkpointer=None):
 
 def open_checkpointer() -> tuple[SqliteSaver, sqlite3.Connection]:
     """SQLite 체크포인터를 연다. reset_data 전에는 반환한 연결을 닫아야 한다."""
-    conn = sqlite3.connect(CHECKPOINT_PATH, check_same_thread=False)
+    conn = sqlite3.connect(data_store.CHECKPOINT_PATH, check_same_thread=False)
     return SqliteSaver(conn), conn
