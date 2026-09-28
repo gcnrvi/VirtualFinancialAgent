@@ -8,7 +8,15 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "google-genai>=2.25.0",
+    "langchain>=1.4.2",
+    "langchain-google-genai>=4.4.0",
+    "langgraph>=1.2.12",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "langsmith>=0.14.1",
+    "python-dotenv>=1.2.3",
     "requests>=2.34.2",
+    "tzdata>=2026.4",
 ]
 
 [project.scripts]
