@@ -19,6 +19,7 @@ CONFIG = {"configurable": {"thread_id": USER_ID}}  # 사용자 단위로 대화 
 
 EXIT_COMMANDS = {"종료", "exit", "quit", "q"}
 RESET_COMMANDS = {"초기화", "/reset"}
+SEED_RESET_COMMANDS = {"초기화 테스트", "/reset seed"}
 HELP_COMMANDS = {"도움말", "/help"}
 
 HELP_TEXT = """\
@@ -30,8 +31,11 @@ HELP_TEXT = """\
   - 생활비 카드 잃어버렸어. 정지해줘
   - 생활비 카드를 집에 둔 것 같아. 잠깐 잠가줘
   - 생활비 카드 찾았어. 잠금 풀어줘
+  - 생활비 카드를 잃어버렸어. 정지하고 재발급해줘
+  - 카드 재발급 신청 상태 알려줘
+  - 재발급 카드 배송지를 회사로 바꿔줘 / 재발급 신청 취소해줘
 승인 질문에는 '승인', '거절' 또는 바꿀 내용('아니, 5만 원만')으로 답하세요.
-명령: 도움말 | 초기화 | 종료"""
+명령: 도움말 | 초기화 | 초기화 테스트(제작 중·배송 중 재발급 신청 포함) | 종료"""
 
 RESTART_NOTICE = "프로그램이 다시 시작되어 승인이 완료되지 않은 요청을 다시 확인할게요."
 
@@ -44,10 +48,10 @@ class App:
         self.saver, self.conn = graph.open_checkpointer()
         self.graph = graph.build_graph(self.saver)
 
-    def reset(self):
+    def reset(self, with_seed: bool = False):
         """체크포인트 연결을 닫은 뒤 업무 데이터와 대화 기록을 함께 초기화한다."""
         self.conn.close()
-        data_store.reset_data()
+        data_store.reset_data(with_seed=with_seed)
         self._open()
 
     # ---- 그래프 실행 ----------------------------------------------------
@@ -161,6 +165,10 @@ def main() -> None:
         if text in RESET_COMMANDS:
             app.reset()
             print("데이터와 대화 기록을 초기 상태로 되돌렸어요.")
+            continue
+        if text in SEED_RESET_COMMANDS:
+            app.reset(with_seed=True)
+            print("테스트 데이터로 초기화했어요. (여행 카드: 분실 정지·재발급 제작 중, 교통 카드: 분실 정지·재발급 배송 중)")
             continue
 
         app.recover()  # 직전 실행이 오류로 멈췄다면 먼저 정리

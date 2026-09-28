@@ -59,6 +59,14 @@ def with_eul(word: str) -> str:
     return f"{word}{'를' if final == 0 else '을'}"
 
 
+def with_eun(word: str) -> str:
+    """받침에 맞춰 '은/는'을 붙인다."""
+    final = _final_consonant(word)
+    if final is None:
+        return f"{word}은(는)"
+    return f"{word}{'는' if final == 0 else '은'}"
+
+
 def _next_id(items: list[dict], id_field: str, prefix: str) -> str:
     """'tx-020'까지 있으면 'tx-021'을 만든다."""
     numbers = [
@@ -154,8 +162,13 @@ def _choice_question(
 # requests (업무 요청 처리 기록)
 # ---------------------------------------------------------------------------
 
-def create_request(user_id: str, task_type: str, params: dict) -> str:
-    """승인 대기 요청을 기록하고 request_id를 돌려준다. 저장 실패 시 SaveError."""
+def create_request(
+    user_id: str, task_type: str, params: dict, parent_request_id: str | None = None
+) -> str:
+    """승인 대기 요청을 기록하고 request_id를 돌려준다. 저장 실패 시 SaveError.
+
+    parent_request_id: 정지 후 재발급처럼 이어진 업무의 앞 단계 요청
+    """
     data = load_data()
     now = now_kst()
     request_id = _next_id(data["requests"], "request_id", "req")
@@ -165,7 +178,7 @@ def create_request(user_id: str, task_type: str, params: dict) -> str:
         "type": task_type,
         "params": params,
         "status": "pending_approval",
-        "parent_request_id": None,
+        "parent_request_id": parent_request_id,
         "created_at": now,
         "updated_at": now,
         "result": None,
@@ -546,7 +559,12 @@ def _make_card_task(action: str):
         card = result["card"]
         error = _validate_card_action(action, card)
         if error:
-            return {"status": "fail", "error": f"{card['name']}: {error}"}
+            # already: 이미 원하는 상태라 할 일이 없음 (복합 업무에서 다음 단계로 넘어가는 데 사용)
+            return {
+                "status": "fail",
+                "error": f"{card['name']}: {error}",
+                "already": card["status"] == rule["to"],
+            }
         return {"status": "ok", "draft": {"card_id": card["card_id"], "to_status": rule["to"]}}
 
     def describe(user_id: str, draft: dict) -> str:
@@ -593,6 +611,358 @@ def _make_card_task(action: str):
 
 
 # ---------------------------------------------------------------------------
+# 카드 재발급 (설계 6-3)
+# ---------------------------------------------------------------------------
+
+APPLICATION_STATUS_LABELS = {
+    "received": "접수",
+    "in_production": "제작 중",
+    "shipping": "배송 중",
+    "delivered": "배송 완료",
+    "cancelled": "취소",
+}
+
+# 수정·취소가 불가능한 신청 상태와 사유
+APPLICATION_LOCKED_REASONS = {
+    "in_production": "카드 제작이 이미 시작되어",
+    "shipping": "카드가 이미 배송 중이라",
+    "delivered": "카드 배송이 이미 끝나",
+    "cancelled": "이미 취소된 신청이라",
+}
+
+
+def _user_addresses(data: dict, user_id: str) -> list[dict]:
+    return [a for a in data["addresses"] if a["owner_id"] == user_id]
+
+
+def _find_address(data: dict, user_id: str, address_id: str) -> dict | None:
+    return next((a for a in _user_addresses(data, user_id) if a["address_id"] == address_id), None)
+
+
+def _resolve_address(data: dict, user_id: str, slots: dict) -> dict:
+    """slots의 address_id(선택 완료) 또는 address(집·회사)를 배송지 하나로 확정한다."""
+    addresses = _user_addresses(data, user_id)
+    if slots.get("address_id"):
+        address = _find_address(data, user_id, slots["address_id"])
+        if address:
+            return {"status": "ok", "address": address}
+    label = slots.get("address")
+    if label:
+        match = next((a for a in addresses if a["label"] == label.strip()), None)
+        if match:
+            return {"status": "ok", "address": match}
+
+    options = [{"id": a["address_id"], "label": f"{a['label']} - {a['address']}"} for a in addresses]
+    lines = [f"{i}) {o['label']}" for i, o in enumerate(options, 1)]
+    prefix = f"'{label}'은(는) 등록된 배송지가 아니에요. " if label else ""
+    return {
+        "status": "ask",
+        "question": f"{prefix}재발급 카드를 받을 배송지를 선택해 주세요.\n" + "\n".join(lines),
+        "missing": ["address"],
+        "candidates": {"slot": "address_id", "options": options},
+    }
+
+
+def _user_applications(data: dict, user_id: str) -> list[dict]:
+    return [a for a in data["reissue_applications"] if a["owner_id"] == user_id]
+
+
+def _open_application(data: dict, card_id: str) -> dict | None:
+    """같은 카드의 취소되지 않은 신청."""
+    return next(
+        (a for a in data["reissue_applications"]
+         if a["card_id"] == card_id and a["status"] != "cancelled"),
+        None,
+    )
+
+
+def _application_brief(data: dict, application: dict) -> dict:
+    card = next((c for c in data["cards"] if c["card_id"] == application["card_id"]), None)
+    address = next((a for a in data["addresses"] if a["address_id"] == application["address_id"]), None)
+    return {
+        "application_id": application["application_id"],
+        "card": card["name"] if card else application["card_id"],
+        "address": f"{address['label']} ({address['address']})" if address else application["address_id"],
+        "status": APPLICATION_STATUS_LABELS.get(application["status"], application["status"]),
+        "created_at": application["created_at"][:10],
+    }
+
+
+def _application_option(data: dict, application: dict) -> dict:
+    b = _application_brief(data, application)
+    return {"id": b["application_id"], "label": f"{b['card']} · {b['address']} · {b['status']} · {b['created_at']}"}
+
+
+def _resolve_application(data: dict, user_id: str, slots: dict, include_cancelled: bool) -> dict:
+    """slots의 application_id(선택 완료), application(신청 ID), card(카드 이름)로 신청 하나를 확정한다.
+
+    반환: {"status": "ok", "application": {...}} / ask(여러 건이면 선택) / fail(기록 없음)
+    """
+    applications = _user_applications(data, user_id)
+    if not include_cancelled:
+        applications = [a for a in applications if a["status"] != "cancelled"]
+
+    chosen_id = slots.get("application_id") or slots.get("application")
+    if chosen_id:
+        match = next((a for a in applications if a["application_id"] == chosen_id.strip()), None)
+        if match is None:
+            return {"status": "fail", "error": f"재발급 신청({chosen_id}) 기록이 없어요."}
+        return {"status": "ok", "application": match}
+
+    card_name = slots.get("card")
+    if card_name:
+        cards, _ = match_cards(data, user_id, card_name)
+        card_ids = {c["card_id"] for c in cards}
+        applications = [a for a in applications if a["card_id"] in card_ids]
+
+    if not applications:
+        target = f"'{card_name}'의 " if card_name else ""
+        return {"status": "fail", "error": f"{target}재발급 신청 기록이 없어요."}
+    if len(applications) == 1:
+        return {"status": "ok", "application": applications[0]}
+
+    recent_first = sorted(applications, key=lambda a: a["created_at"], reverse=True)
+    options = [_application_option(data, a) for a in recent_first]
+    lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
+    return {
+        "status": "ask",
+        "question": "재발급 신청이 여러 건 있어요. 어느 신청인가요?\n" + "\n".join(lines),
+        "missing": [],
+        "candidates": {"slot": "application_id", "options": options},
+    }
+
+
+# ---- 재발급 신청 ------------------------------------------------------------
+
+def _validate_reissue(data: dict, card: dict) -> str | None:
+    if card["status"] != "lost":
+        return (
+            f"{with_eun(card['name'])} 분실 정지 상태가 아니라 재발급을 신청할 수 없어요. "
+            "먼저 분실 정지를 해 주세요."
+        )
+    existing = _open_application(data, card["card_id"])
+    if existing:
+        b = _application_brief(data, existing)
+        return (
+            f"{with_eun(card['name'])} 이미 재발급 신청이 있어요. "
+            f"(신청 {b['application_id']}, 배송지 {b['address']}, 상태 {b['status']})"
+        )
+    return None
+
+
+def resolve_reissue(user_id: str, slots: dict) -> dict:
+    """대상 카드 → 분실 정지 여부·기존 신청 → 배송지 순서로 검증한다."""
+    data = load_data()
+    result = _resolve_card(data, user_id, slots)
+    if result["status"] != "ok":
+        return result
+    card = result["card"]
+
+    error = _validate_reissue(data, card)
+    if error:
+        return {"status": "fail", "error": error}
+
+    result = _resolve_address(data, user_id, slots)
+    if result["status"] != "ok":
+        return result
+    return {
+        "status": "ok",
+        "draft": {"card_id": card["card_id"], "address_id": result["address"]["address_id"]},
+    }
+
+
+def describe_reissue(user_id: str, draft: dict) -> str:
+    data = load_data()
+    card = _find_card(data, user_id, draft["card_id"])
+    address = _find_address(data, user_id, draft["address_id"])
+    return (
+        "[카드 재발급 신청]\n"
+        f"- 카드: {card['name']} ({card['card_id']})\n"
+        f"- 배송지: {address['label']} ({address['address']})\n"
+        "- 안내: 신청해도 기존 카드의 분실 정지는 그대로 유지돼요."
+    )
+
+
+def execute_reissue(user_id: str, request_id: str) -> dict:
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    card = _find_card(data, user_id, draft["card_id"])
+    address = _find_address(data, user_id, draft["address_id"])
+    error = "카드나 배송지를 찾을 수 없어요." if card is None or address is None else _validate_reissue(data, card)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    now = now_kst()
+    application_id = _next_id(data["reissue_applications"], "application_id", "rei")
+    data["reissue_applications"].append({
+        "application_id": application_id,
+        "owner_id": user_id,
+        "card_id": card["card_id"],
+        "address_id": address["address_id"],
+        "status": "received",
+        "request_id": request_id,
+        "created_at": now,
+        "updated_at": now,
+    })
+    message = (
+        f"{card['name']} 재발급을 신청했어요. (신청 {application_id}, 배송지 {address['label']}) "
+        "기존 카드는 분실 정지 상태로 유지돼요."
+    )
+    _set_request_result(request, "completed", message, application_id=application_id)
+    return _save_result(data, message)
+
+
+# ---- 재발급 조회 ------------------------------------------------------------
+
+def query_reissue(user_id: str, slots: dict | None = None) -> dict:
+    """신청 하나를 골라 배송지와 처리 상태를 보여준다. 불명확하면 목록에서 선택받는다."""
+    data = load_data()
+    result = _resolve_application(data, user_id, slots or {}, include_cancelled=True)
+    if result["status"] != "ok":
+        return result
+    return {"status": "ok", "application": _application_brief(data, result["application"])}
+
+
+# ---- 재발급 수정·취소 -------------------------------------------------------
+
+def _validate_editable(application: dict) -> str | None:
+    """접수 상태의 신청만 수정·취소할 수 있다."""
+    reason = APPLICATION_LOCKED_REASONS.get(application["status"])
+    if reason:
+        status = APPLICATION_STATUS_LABELS[application["status"]]
+        return f"{reason} 변경하거나 취소할 수 없어요. (현재 상태: {status})"
+    return None
+
+
+def resolve_modify_reissue(user_id: str, slots: dict) -> dict:
+    """대상 신청 → 수정 가능 상태 → 새 배송지 → 기존 배송지와 다른지 순서로 검증한다."""
+    data = load_data()
+    result = _resolve_application(data, user_id, slots, include_cancelled=False)
+    if result["status"] != "ok":
+        return result
+    application = result["application"]
+
+    error = _validate_editable(application)
+    if error:
+        return {"status": "fail", "error": error}
+
+    result = _resolve_address(data, user_id, slots)
+    if result["status"] != "ok":
+        return result
+    address = result["address"]
+    if address["address_id"] == application["address_id"]:
+        return {"status": "fail", "error": f"이미 배송지가 {with_ro(address['label'])} 되어 있어요."}
+    return {
+        "status": "ok",
+        "draft": {"application_id": application["application_id"], "address_id": address["address_id"]},
+    }
+
+
+def describe_modify_reissue(user_id: str, draft: dict) -> str:
+    data = load_data()
+    application = _find_application(data, draft["application_id"])
+    b = _application_brief(data, application)
+    new = _find_address(data, user_id, draft["address_id"])
+    return (
+        "[재발급 배송지 변경]\n"
+        f"- 신청: {b['application_id']} ({b['card']}, {b['status']})\n"
+        f"- 배송지: {b['address']} → {new['label']} ({new['address']})"
+    )
+
+
+def execute_modify_reissue(user_id: str, request_id: str) -> dict:
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    application = _find_application(data, draft["application_id"])
+    address = _find_address(data, user_id, draft["address_id"])
+    error = "신청이나 배송지를 찾을 수 없어요." if application is None or address is None else _validate_editable(application)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    before = application["address_id"]
+    application["address_id"] = address["address_id"]
+    application["updated_at"] = now_kst()
+    message = f"재발급 신청 {application['application_id']}의 배송지를 {with_ro(address['label'])} 바꿨어요."
+    _set_request_result(request, "completed", message, before_address_id=before)
+    return _save_result(data, message)
+
+
+def resolve_cancel_reissue(user_id: str, slots: dict) -> dict:
+    data = load_data()
+    result = _resolve_application(data, user_id, slots, include_cancelled=False)
+    if result["status"] != "ok":
+        return result
+    application = result["application"]
+    error = _validate_editable(application)
+    if error:
+        return {"status": "fail", "error": error}
+    return {"status": "ok", "draft": {"application_id": application["application_id"]}}
+
+
+def describe_cancel_reissue(user_id: str, draft: dict) -> str:
+    data = load_data()
+    b = _application_brief(data, _find_application(data, draft["application_id"]))
+    return (
+        "[재발급 신청 취소]\n"
+        f"- 신청: {b['application_id']} ({b['card']}, 배송지 {b['address']}, {b['status']})\n"
+        "- 안내: 취소해도 기존 카드의 분실 정지는 유지돼요."
+    )
+
+
+def execute_cancel_reissue(user_id: str, request_id: str) -> dict:
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    application = _find_application(data, request["params"]["application_id"])
+    error = "신청을 찾을 수 없어요." if application is None else _validate_editable(application)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    application["status"] = "cancelled"
+    application["updated_at"] = now_kst()
+    message = f"재발급 신청 {with_eul(application['application_id'])} 취소했어요. 기존 카드의 분실 정지는 유지돼요."
+    _set_request_result(request, "completed", message)
+    return _save_result(data, message)
+
+
+def _find_application(data: dict, application_id: str) -> dict | None:
+    return next(
+        (a for a in data["reissue_applications"] if a["application_id"] == application_id), None
+    )
+
+
+# ---- 실행 공통 ---------------------------------------------------------------
+
+def _fail_and_save(data: dict, request: dict, error: str) -> dict:
+    """실행 직전 재검증 실패: 요청만 failed로 기록한다. 데이터는 바꾸지 않는다."""
+    _set_request_result(request, "failed", error)
+    try:
+        save_data(data)
+    except SaveError:
+        pass
+    return {"status": "failed", "message": f"처리하지 못했어요. {error}"}
+
+
+def _save_result(data: dict, message: str) -> dict:
+    """변경 내용과 요청 기록을 한 번에 저장한다. 실패하면 파일은 실행 전 상태로 남는다."""
+    try:
+        save_data(data)
+    except SaveError as e:
+        return {"status": "failed", "message": f"변경 내용을 저장하지 못해 반영되지 않았어요. ({e})"}
+    return {"status": "completed", "message": message}
+
+
+# ---------------------------------------------------------------------------
 # 업무 레지스트리
 # ---------------------------------------------------------------------------
 
@@ -629,4 +999,27 @@ TASKS: dict[str, Task] = {
     "report_lost": _card_task("report_lost"),
     "lock_card": _card_task("lock_card"),
     "unlock_card": _card_task("unlock_card"),
+    "reissue_card": Task(
+        kind="change", label="카드 재발급 신청", slots=("card", "address"),
+        resolve=resolve_reissue, describe=describe_reissue, execute=execute_reissue,
+    ),
+    "query_reissue": Task(
+        kind="query", label="재발급 신청 조회", slots=("card", "application"), query=query_reissue,
+    ),
+    "modify_reissue": Task(
+        kind="change", label="재발급 배송지 변경", slots=("card", "application", "address"),
+        resolve=resolve_modify_reissue, describe=describe_modify_reissue, execute=execute_modify_reissue,
+    ),
+    "cancel_reissue": Task(
+        kind="change", label="재발급 신청 취소", slots=("card", "application"),
+        resolve=resolve_cancel_reissue, describe=describe_cancel_reissue, execute=execute_cancel_reissue,
+    ),
+}
+
+# 여러 업무를 이어서 처리하는 복합 업무. 각 단계는 따로 승인받는다. (설계 6-3)
+#   - 앞 단계를 거절하거나 실행에 실패하면 뒤 단계는 진행하지 않는다.
+#   - 앞 단계가 이미 완료된 상태(already)이면 건너뛰고 다음 단계로 간다.
+#   - 뒤 단계가 실패·취소돼도 앞 단계 결과는 되돌리지 않는다.
+COMPOSITES: dict[str, list[str]] = {
+    "lost_and_reissue": ["report_lost", "reissue_card"],
 }

@@ -3,12 +3,14 @@
 # LangGraph의 중단·재개로 사용자 승인을 처리합니다.
 #
 # 흐름 (docs/design_draft.md 2절)
-#   parse_request → lookup ─────────────────────────────→ respond
+#   parse_request → lookup → respond        (대상이 불명확하면 ask_user → lookup)
 #                 → resolve → ask_user → resolve
 #                           → create_request → confirm → execute → next_task → respond
 #                                                      → (거절) next_task
 #                                                      → (수정) resolve
 #                                                      → (판단 불가) confirm
+#                           → (복합 업무에서 이미 완료된 단계) next_task
+#   next_task: task_queue에 남은 단계가 있으면 resolve, 없으면 respond
 
 import sqlite3
 from functools import lru_cache
@@ -43,6 +45,7 @@ def get_llm() -> ChatGoogleGenerativeAI:
 Intent = Literal[
     "query_accounts", "transfer",
     "query_cards", "report_lost", "lock_card", "unlock_card",
+    "reissue_card", "lost_and_reissue", "query_reissue", "modify_reissue", "cancel_reissue",
     "unknown",
 ]
 
@@ -53,6 +56,11 @@ INTENT_GUIDE = """\
 - report_lost: 카드를 잃어버렸거나 도난당해 정지 요청 (되돌릴 수 없음)
 - lock_card: 카드를 잠깐 못 쓰게 잠그는 요청 (집에 두고 옴, 잠시 보관 등)
 - unlock_card: 잠근 카드를 다시 쓰도록 푸는 요청 (카드를 찾음 등)
+- reissue_card: 카드 재발급 신청만 요청 (정지 요청은 없음)
+- lost_and_reissue: 카드 분실 정지와 재발급을 함께 요청 (예: 잃어버렸어, 정지하고 재발급해줘)
+- query_reissue: 재발급 신청의 상태·배송지 조회
+- modify_reissue: 재발급 신청의 배송지 변경
+- cancel_reissue: 재발급 신청 취소
 - unknown: 그 외 또는 판단 불가"""
 
 
@@ -62,6 +70,8 @@ class Slots(BaseModel):
     to_account: str | None = Field(None, description="입금 계좌 별명. 언급이 없으면 null")
     amount: int | None = Field(None, description="원 단위 정수. '10만 원' → 100000, 음수도 그대로. 언급이 없으면 null")
     card: str | None = Field(None, description="카드 이름 또는 카드 ID. 언급이 없으면 null")
+    address: Literal["집", "회사"] | None = Field(None, description="재발급 카드 배송지. 언급이 없으면 null")
+    application: str | None = Field(None, description="재발급 신청 ID (예: rei-001). 언급이 없으면 null")
 
 
 class ParsedRequest(Slots):
@@ -102,7 +112,11 @@ class BankState(TypedDict, total=False):
     request_id: str | None        # 현재 처리 중인 requests 항목
     decision: str | None          # approve | reject | modify | unclear
     result: dict | None           # 조회·실행 결과
-    task_queue: list[dict]        # 이어서 처리할 업무 (3단계에서 사용)
+    task_queue: list[dict]        # 이어서 처리할 업무 [{"intent", "slots"}] (정지 후 재발급)
+    multi_step: bool              # 복합 업무 진행 중 여부
+    parent_request_id: str | None # 복합 업무에서 앞 단계의 요청 ID
+    log: list[str]                # 복합 업무의 단계별 결과
+    log_shown: int                # log 중 사용자에게 이미 보여준 개수
     last_targets: dict            # 최근 다룬 대상 (6단계에서 사용)
 
 
@@ -110,7 +124,7 @@ class BankState(TypedDict, total=False):
 TASK_FIELDS = {
     "slots": {}, "slots_backup": None, "draft": None, "step": None,
     "question": None, "candidates": None, "plan": None, "notice": None,
-    "request_id": None, "decision": None,
+    "request_id": None, "decision": None, "parent_request_id": None,
 }
 
 
@@ -125,7 +139,14 @@ def _user_context(user_id: str) -> str:
         f"- {c['name']} ({c['card_id']})"
         for c in data["cards"] if c["owner_id"] == user_id
     )
-    return f"사용자의 계좌 목록:\n{accounts}\n사용자의 카드 목록:\n{cards}"
+    applications = "\n".join(
+        f"- {a['application_id']} ({a['card_id']}, {fn.APPLICATION_STATUS_LABELS[a['status']]})"
+        for a in data["reissue_applications"] if a["owner_id"] == user_id
+    ) or "- 없음"
+    return (
+        f"사용자의 계좌 목록:\n{accounts}\n사용자의 카드 목록:\n{cards}\n"
+        f"사용자의 재발급 신청 목록:\n{applications}"
+    )
 
 
 def _pick_slots(model: BaseModel, intent: str) -> dict:
@@ -155,7 +176,7 @@ def parse_request(state: BankState) -> dict:
     today = fn.today_kst()
     update = {
         **TASK_FIELDS, "today": today, "error": None, "result": None,
-        "task_queue": [],
+        "task_queue": [], "multi_step": False, "log": [], "log_shown": 0,
     }
 
     prompt = (
@@ -171,6 +192,17 @@ def parse_request(state: BankState) -> dict:
     except Exception as e:
         return {**update, "intent": "unknown", "error": f"요청을 해석하지 못했어요. 다시 말씀해 주세요. ({type(e).__name__})"}
 
+    if parsed.intent in fn.COMPOSITES:
+        # 복합 업무: 첫 단계를 바로 진행하고 나머지는 task_queue에 넣는다.
+        first, *rest = fn.COMPOSITES[parsed.intent]
+        return {
+            **update,
+            "intent": first,
+            "slots": _pick_slots(parsed, first),
+            "task_queue": [{"intent": i, "slots": _pick_slots(parsed, i)} for i in rest],
+            "multi_step": True,
+        }
+
     slots = _pick_slots(parsed, parsed.intent) if parsed.intent in fn.TASKS else {}
     return {**update, "intent": parsed.intent, "slots": slots}
 
@@ -178,9 +210,11 @@ def parse_request(state: BankState) -> dict:
 def lookup(state: BankState) -> dict:
     task = fn.TASKS[state["intent"]]
     result = task.query(state["user_id"], state.get("slots", {}))
+    if result["status"] == "ask":
+        return {"step": "ask", "question": result["question"], "candidates": result.get("candidates")}
     if result["status"] == "fail":
-        return {"error": result["error"]}
-    return {"result": result}
+        return {"step": "fail", "error": result["error"]}
+    return {"step": "ok", "result": result}
 
 
 def resolve(state: BankState) -> dict:
@@ -200,6 +234,9 @@ def resolve(state: BankState) -> dict:
             "slots_backup": None,
             "notice": f"그렇게 바꿀 수 없어요. {r['error']} 기존 처리안을 유지할게요.",
         }
+    # 복합 업무에서 이미 원하는 상태면(예: 이미 분실 정지) 이 단계를 건너뛰고 다음 단계로 간다.
+    if r.get("already") and state.get("task_queue"):
+        return {"step": "skip", "log": _log(state, f"{r['error']} 이 단계는 건너뛸게요.")}
     # 이미 기록된 요청을 다시 검증하다 실패하면(재시작 복구 등) 요청도 실패로 남긴다.
     if state.get("request_id"):
         fn.fail_request(state["request_id"], r["error"])
@@ -210,9 +247,10 @@ def ask_user(state: BankState) -> dict:
     """빠진 정보나 후보 선택을 묻고, 답변을 slots에 반영한다."""
     question = state["question"]
     candidates = state.get("candidates")
-    answer = interrupt({"type": "question", "question": question})
+    shown = "\n\n".join(filter(None, [_unshown_log(state), question]))
+    answer = interrupt({"type": "question", "question": shown})
 
-    messages = [AIMessage(question), HumanMessage(answer)]
+    messages = [AIMessage(shown), HumanMessage(answer)]
     prompt = (
         "은행 앱이 사용자에게 추가 정보를 물었고, 사용자가 답했습니다. 답변에서 값을 추출하세요.\n"
         f"진행 중인 업무: {fn.TASKS[state['intent']].label}\n"
@@ -227,12 +265,16 @@ def ask_user(state: BankState) -> dict:
         reply = get_llm().with_structured_output(SlotAnswer).invoke(prompt)
     except Exception:
         # 해석 실패 시 slots를 바꾸지 않고 resolve로 돌아가 같은 질문을 다시 한다.
-        return {"messages": messages}
+        return {"messages": messages, "log_shown": len(state.get("log") or [])}
 
     if reply.cancel:
         if state.get("request_id"):
             fn.cancel_request(state["request_id"])
-        return {"messages": messages, "step": "cancel", "error": "요청을 취소했어요. 변경된 내용은 없어요."}
+        message = (
+            "이 단계부터 요청을 취소했어요. 앞 단계에서 처리된 내용은 그대로 유지돼요."
+            if state.get("log") else "요청을 취소했어요. 변경된 내용은 없어요."
+        )
+        return {"messages": messages, "step": "cancel", "error": message, "log_shown": len(state.get("log") or [])}
 
     slots = _merge_slots(state["slots"], _pick_slots(reply, state["intent"]))
 
@@ -241,7 +283,7 @@ def ask_user(state: BankState) -> dict:
         if reply.selected_id in valid_ids:
             slots[candidates["slot"]] = reply.selected_id
 
-    return {"messages": messages, "slots": slots, "step": None}
+    return {"messages": messages, "slots": slots, "step": None, "log_shown": len(state.get("log") or [])}
 
 
 def create_request(state: BankState) -> dict:
@@ -252,7 +294,9 @@ def create_request(state: BankState) -> dict:
         if request_id:
             fn.update_request_params(request_id, state["draft"])
         else:
-            request_id = fn.create_request(state["user_id"], state["intent"], state["draft"])
+            request_id = fn.create_request(
+                state["user_id"], state["intent"], state["draft"], state.get("parent_request_id")
+            )
     except SaveError as e:
         return {"step": "fail", "error": f"요청을 기록하지 못해 진행할 수 없어요. ({e})"}
 
@@ -268,7 +312,7 @@ def confirm(state: BankState) -> dict:
     """처리안을 보여주고 승인·거절·수정을 받는다."""
     notice = state.get("notice")
     question = "이대로 진행할까요? (승인 / 거절 / 바꿀 내용)"
-    shown = "\n\n".join(filter(None, [notice, state["plan"], question]))
+    shown = "\n\n".join(filter(None, [_unshown_log(state), notice, state["plan"], question]))
     answer = interrupt({"type": "approval", "request_id": state["request_id"], "message": shown})
 
     messages = [AIMessage(shown), HumanMessage(answer)]
@@ -282,12 +326,16 @@ def confirm(state: BankState) -> dict:
     except Exception:
         reply = ApprovalReply(decision="unclear")
 
-    base = {"messages": messages, "notice": None, "decision": reply.decision}
+    base = {
+        "messages": messages, "notice": None, "decision": reply.decision,
+        "log_shown": len(state.get("log") or []),
+    }
 
     if reply.decision == "approve":
         return base
     if reply.decision == "reject":
-        return {**base, "result": fn.cancel_request(state["request_id"])}
+        result = fn.cancel_request(state["request_id"])
+        return {**base, "result": result, **_stop_queue(state, result["message"])}
     if reply.decision == "modify":
         changes = _pick_slots(reply, state["intent"])
         if any(v is not None for v in changes.values()):
@@ -306,27 +354,74 @@ def confirm(state: BankState) -> dict:
 
 def execute(state: BankState) -> dict:
     task = fn.TASKS[state["intent"]]
-    return {"result": task.execute(state["user_id"], state["request_id"])}
+    result = task.execute(state["user_id"], state["request_id"])
+    if result["status"] == "completed":
+        return {"result": result, "log": _log(state, result["message"])}
+    # 실행에 실패하면 뒤 단계는 진행하지 않는다.
+    return {"result": result, **_stop_queue(state, result["message"])}
 
 
 def next_task(state: BankState) -> dict:
-    """task_queue에 이어서 처리할 업무가 있으면 꺼낸다. (정지 후 재발급 등, 3단계)"""
+    """task_queue에 이어서 처리할 업무가 있으면 꺼낸다. (정지 후 재발급)"""
     queue = list(state.get("task_queue") or [])
     if not queue:
         return {"step": "done"}
     task = queue.pop(0)
+
+    # 앞 단계에서 확정한 대상(예: 후보에서 고른 카드)은 다음 단계에서도 그대로 쓴다.
+    slots = dict(task["slots"])
+    for key, value in (state.get("draft") or {}).items():
+        if key.endswith("_id") and key[:-3] in slots:
+            slots[key] = value
+
     return {
         **TASK_FIELDS,
         "step": "next",
         "intent": task["intent"],
-        "slots": task["slots"],
+        "slots": slots,
         "task_queue": queue,
+        "parent_request_id": state.get("request_id") or state.get("parent_request_id"),
     }
 
 
 def respond(state: BankState) -> dict:
     """결과를 안내 문장으로 만들고 업무 필드를 정리한다."""
-    return {"messages": [AIMessage(_format_response(state))], **TASK_FIELDS}
+    parts = list((state.get("log") or [])[state.get("log_shown", 0):])  # 아직 보여주지 않은 결과만
+    if state.get("error"):
+        parts.append(_labeled(state, state["error"]))
+    if not parts:
+        parts.append(_format_response(state))
+    return {
+        "messages": [AIMessage("\n".join(parts))],
+        **TASK_FIELDS, "log": [], "log_shown": 0, "multi_step": False,
+    }
+
+
+def _labeled(state: BankState, message: str) -> str:
+    """복합 업무에서는 어느 단계의 결과인지 앞에 붙인다."""
+    if state.get("multi_step") and state.get("intent") in fn.TASKS:
+        return f"[{fn.TASKS[state['intent']].label}] {message}"
+    return message
+
+
+def _unshown_log(state: BankState) -> str | None:
+    """복합 업무에서 앞 단계 결과를 다음 질문 앞에 먼저 보여준다."""
+    new = (state.get("log") or [])[state.get("log_shown", 0):]
+    return "\n".join(new) if new else None
+
+
+def _log(state: BankState, message: str) -> list[str]:
+    return [*(state.get("log") or []), _labeled(state, message)]
+
+
+def _stop_queue(state: BankState, message: str) -> dict:
+    """현재 단계 결과를 기록하고, 남은 단계가 있으면 진행하지 않았다고 안내한다."""
+    log = _log(state, message)
+    queue = state.get("task_queue") or []
+    if queue:
+        labels = ", ".join(fn.TASKS[t["intent"]].label for t in queue)
+        log.append(f"앞 단계가 완료되지 않아 {fn.with_eun(labels)} 진행하지 않았어요.")
+    return {"log": log, "task_queue": []}
 
 
 def _format_response(state: BankState) -> str:
@@ -342,11 +437,17 @@ def _format_response(state: BankState) -> str:
     if intent == "query_cards":
         lines = [f"- {c['name']} ({c['card_id']}, {c['card_type']}): {c['status']}" for c in result["cards"]]
         return "카드 목록이에요.\n" + "\n".join(lines)
+    if intent == "query_reissue":
+        a = result["application"]
+        return (
+            f"재발급 신청 {a['application_id']}\n- 카드: {a['card']}\n- 배송지: {a['address']}\n"
+            f"- 상태: {a['status']}\n- 신청일: {a['created_at']}"
+        )
     if intent in fn.TASKS and result.get("message"):
         return result["message"]
     return (
-        "지금은 계좌 조회·이체와 카드 조회·분실 정지·잠금·잠금 해제를 도와드릴 수 있어요.\n"
-        "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘', '생활비 카드 잃어버렸어'"
+        "지금은 계좌 조회·이체, 카드 조회·분실 정지·잠금·해제, 카드 재발급 신청·조회·변경·취소를 도와드릴 수 있어요.\n"
+        "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘', '생활비 카드 잃어버렸어. 정지하고 재발급해줘'"
     )
 
 
@@ -361,12 +462,20 @@ def route_after_parse(state: BankState) -> str:
     return "lookup" if task.kind == "query" else "resolve"
 
 
+def route_after_lookup(state: BankState) -> str:
+    return "ask_user" if state.get("step") == "ask" else "respond"
+
+
 def route_after_resolve(state: BankState) -> str:
-    return {"ok": "create_request", "ask": "ask_user", "revert": "confirm"}.get(state["step"], "respond")
+    return {
+        "ok": "create_request", "ask": "ask_user", "revert": "confirm", "skip": "next_task",
+    }.get(state["step"], "respond")
 
 
 def route_after_ask(state: BankState) -> str:
-    return "respond" if state.get("step") == "cancel" else "resolve"
+    if state.get("step") == "cancel":
+        return "respond"
+    return "lookup" if fn.TASKS[state["intent"]].kind == "query" else "resolve"
 
 
 def route_after_create(state: BankState) -> str:
@@ -400,9 +509,9 @@ def build_graph(checkpointer=None):
 
     builder.add_edge(START, "parse_request")
     builder.add_conditional_edges("parse_request", route_after_parse, ["lookup", "resolve", "respond"])
-    builder.add_edge("lookup", "respond")
-    builder.add_conditional_edges("resolve", route_after_resolve, ["create_request", "ask_user", "confirm", "respond"])
-    builder.add_conditional_edges("ask_user", route_after_ask, ["resolve", "respond"])
+    builder.add_conditional_edges("lookup", route_after_lookup, ["ask_user", "respond"])
+    builder.add_conditional_edges("resolve", route_after_resolve, ["create_request", "ask_user", "confirm", "next_task", "respond"])
+    builder.add_conditional_edges("ask_user", route_after_ask, ["lookup", "resolve", "respond"])
     builder.add_conditional_edges("create_request", route_after_create, ["confirm", "respond"])
     builder.add_conditional_edges("confirm", route_after_confirm, ["execute", "next_task", "resolve", "confirm"])
     builder.add_edge("execute", "next_task")

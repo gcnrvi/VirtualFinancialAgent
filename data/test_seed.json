@@ -1,0 +1,54 @@
+{
+  "cards": [
+    {
+      "card_id": "card-002",
+      "owner_id": "user-001",
+      "name": "여행 카드",
+      "account_id": "acc-003",
+      "status": "lost",
+      "card_number": "0000-0000-0000-0002",
+      "card_type": "debit"
+    },
+    {
+      "card_id": "card-005",
+      "owner_id": "user-001",
+      "name": "교통 카드",
+      "account_id": "acc-001",
+      "status": "lost",
+      "card_number": "0000-0000-0000-0005",
+      "card_type": "debit"
+    }
+  ],
+  "reissue_applications": [
+    {
+      "application_id": "rei-001",
+      "owner_id": "user-001",
+      "card_id": "card-002",
+      "address_id": "addr-home",
+      "status": "in_production",
+      "request_id": null,
+      "created_at": "2026-09-20T10:00:00+09:00",
+      "updated_at": "2026-09-22T09:00:00+09:00"
+    },
+    {
+      "application_id": "rei-002",
+      "owner_id": "user-001",
+      "card_id": "card-005",
+      "address_id": "addr-home",
+      "status": "cancelled",
+      "request_id": null,
+      "created_at": "2026-09-15T10:00:00+09:00",
+      "updated_at": "2026-09-16T10:00:00+09:00"
+    },
+    {
+      "application_id": "rei-003",
+      "owner_id": "user-001",
+      "card_id": "card-005",
+      "address_id": "addr-work",
+      "status": "shipping",
+      "request_id": null,
+      "created_at": "2026-09-18T10:00:00+09:00",
+      "updated_at": "2026-09-24T15:00:00+09:00"
+    }
+  ]
+}
