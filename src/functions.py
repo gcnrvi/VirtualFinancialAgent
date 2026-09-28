@@ -37,13 +37,26 @@ def won(amount: int) -> str:
     return f"{amount:,}원"
 
 
+def _final_consonant(word: str) -> int | None:
+    """마지막 글자의 받침 번호 (0: 받침 없음, 8: ㄹ). 한글이 아니면 None."""
+    code = ord(word[-1]) - 0xAC00
+    return code % 28 if 0 <= code <= 11171 else None
+
+
 def with_ro(word: str) -> str:
     """받침에 맞춰 '로/으로'를 붙인다. (ㄹ 받침은 '로')"""
-    code = ord(word[-1]) - 0xAC00
-    if not 0 <= code <= 11171:
+    final = _final_consonant(word)
+    if final is None:
         return f"{word}(으)로"
-    final = code % 28
-    return f"{word}{'으로' if final not in (0, 8) else '로'}"
+    return f"{word}{'로' if final in (0, 8) else '으로'}"
+
+
+def with_eul(word: str) -> str:
+    """받침에 맞춰 '을/를'을 붙인다."""
+    final = _final_consonant(word)
+    if final is None:
+        return f"{word}을(를)"
+    return f"{word}{'를' if final == 0 else '을'}"
 
 
 def _next_id(items: list[dict], id_field: str, prefix: str) -> str:
@@ -118,15 +131,22 @@ def _resolve_account_slot(
     if exact and len(matches) == 1:
         return {"status": "ok", "account": matches[0]}
 
-    options = [_account_brief(a) for a in matches]
-    lines = [f"{i}) {o['nickname']} ({o['account_id']})" for i, o in enumerate(options, 1)]
+    options = [{"id": a["account_id"], "label": a["nickname"]} for a in matches]
+    return _choice_question(label, name, "계좌", exact, f"{role}_id", options)
+
+
+def _choice_question(
+    label: str, name: str, noun: str, exact: bool, slot: str, options: list[dict]
+) -> dict:
+    """후보 중 하나를 고르게 하는 ask 결과를 만든다. options: [{"id", "label"}]"""
+    lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
     reason = "여러 개 있어요" if exact else "정확히 일치하지 않아요"
     return {
         "status": "ask",
-        "question": f"{label} '{name}'에 해당하는 계좌가 {reason}. 어느 계좌인가요?\n"
+        "question": f"{label} '{name}'에 해당하는 {noun}가 {reason}. 어느 {noun}인가요?\n"
         + "\n".join(lines),
         "missing": [],
-        "candidates": {"slot": f"{role}_id", "options": options},
+        "candidates": {"slot": slot, "options": options},
     }
 
 
@@ -390,6 +410,189 @@ def _transfer_transaction(
 
 
 # ---------------------------------------------------------------------------
+# 카드
+# ---------------------------------------------------------------------------
+
+CARD_STATUS_LABELS = {"active": "사용 가능", "locked": "일시 잠금", "lost": "분실 정지"}
+CARD_TYPE_LABELS = {"debit": "체크카드", "credit": "신용카드"}
+
+# 카드 상태 변경 업무: 허용되는 현재 상태 → 바뀔 상태, 거부 사유 (설계 6-3)
+CARD_ACTIONS = {
+    "report_lost": {
+        "label": "카드 분실 정지",
+        "allowed": {"active", "locked"},
+        "to": "lost",
+        "reject": {"lost": "이미 분실 정지된 카드예요."},
+        "note": "분실 정지 후에는 잠금 해제로 되돌릴 수 없고, 재발급을 신청해야 해요.",
+    },
+    "lock_card": {
+        "label": "카드 일시 잠금",
+        "allowed": {"active"},
+        "to": "locked",
+        "reject": {
+            "locked": "이미 일시 잠금된 카드예요.",
+            "lost": "분실 정지된 카드는 이미 사용이 막혀 있어 잠글 수 없어요.",
+        },
+        "note": "카드를 찾으면 잠금 해제할 수 있어요. 계좌 잔액과 기존 거래는 바뀌지 않아요.",
+    },
+    "unlock_card": {
+        "label": "카드 잠금 해제",
+        "allowed": {"locked"},
+        "to": "active",
+        "reject": {
+            "active": "잠겨 있지 않은 카드예요. 이미 사용 가능한 상태예요.",
+            "lost": "분실 정지된 카드는 잠금 해제로 다시 사용할 수 없어요. 재발급을 신청해 주세요.",
+        },
+        "note": None,
+    },
+}
+
+
+def _user_cards(data: dict, user_id: str) -> list[dict]:
+    return [c for c in data["cards"] if c["owner_id"] == user_id]
+
+
+def _find_card(data: dict, user_id: str, card_id: str) -> dict | None:
+    return next((c for c in _user_cards(data, user_id) if c["card_id"] == card_id), None)
+
+
+def _normalize_card_name(name: str) -> str:
+    """'생활비 카드', '생활비카드', '생활비' 를 같은 이름으로 비교한다."""
+    name = re.sub(r"\s+", "", name)
+    return re.sub(r"카드$", "", name)
+
+
+def match_cards(data: dict, user_id: str, name: str) -> tuple[list[dict], bool]:
+    """카드 이름(또는 카드 ID)으로 내 카드를 찾는다. 반환 형식은 match_accounts와 같다."""
+    cards = _user_cards(data, user_id)
+    by_id = [c for c in cards if c["card_id"] == name.strip()]
+    if by_id:
+        return by_id, True
+    key = _normalize_card_name(name)
+    exact = [c for c in cards if _normalize_card_name(c["name"]) == key]
+    if exact:
+        return exact, True
+    partial = [c for c in cards if key and key in _normalize_card_name(c["name"])]
+    return partial, False
+
+
+def _card_brief(card: dict) -> dict:
+    return {
+        "card_id": card["card_id"],
+        "name": card["name"],
+        "card_type": CARD_TYPE_LABELS.get(card["card_type"], card["card_type"]),
+        "status": CARD_STATUS_LABELS.get(card["status"], card["status"]),
+    }
+
+
+def query_cards(user_id: str, slots: dict | None = None) -> dict:
+    """카드 이름·ID·종류·상태를 돌려준다. 카드 이름이 있으면 해당 카드만 보여준다."""
+    data = load_data()
+    cards = _user_cards(data, user_id)
+    name = (slots or {}).get("card")
+    if name:
+        matches, _ = match_cards(data, user_id, name)
+        if not matches:
+            return {"status": "fail", "error": f"'{name}' 카드를 찾을 수 없어요."}
+        cards = matches
+    return {"status": "ok", "cards": [_card_brief(c) for c in cards]}
+
+
+def _resolve_card(data: dict, user_id: str, slots: dict) -> dict:
+    """slots의 card_id(선택 완료) 또는 card(이름)를 카드 하나로 확정한다."""
+    card_id = slots.get("card_id")
+    if card_id:
+        card = _find_card(data, user_id, card_id)
+        if card is None:
+            return {"status": "fail", "error": f"카드({card_id})를 찾을 수 없어요."}
+        return {"status": "ok", "card": card}
+
+    name = slots.get("card")
+    if not name:
+        options = [{"id": c["card_id"], "label": c["name"]} for c in _user_cards(data, user_id)]
+        lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
+        return {
+            "status": "ask",
+            "question": "어느 카드인가요?\n" + "\n".join(lines),
+            "missing": ["card"],
+            "candidates": {"slot": "card_id", "options": options},
+        }
+
+    matches, exact = match_cards(data, user_id, name)
+    if not matches:
+        return {"status": "fail", "error": f"'{name}' 카드를 찾을 수 없어요."}
+    if exact and len(matches) == 1:
+        return {"status": "ok", "card": matches[0]}
+    options = [{"id": c["card_id"], "label": c["name"]} for c in matches]
+    return _choice_question("대상 카드", name, "카드", exact, "card_id", options)
+
+
+def _validate_card_action(action: str, card: dict) -> str | None:
+    rule = CARD_ACTIONS[action]
+    if card["status"] in rule["allowed"]:
+        return None
+    return rule["reject"].get(card["status"], f"현재 상태({card['status']})에서는 할 수 없어요.")
+
+
+def _make_card_task(action: str):
+    """분실 정지·일시 잠금·잠금 해제는 상태 전이만 다르므로 같은 함수 틀로 만든다."""
+    rule = CARD_ACTIONS[action]
+
+    def resolve(user_id: str, slots: dict) -> dict:
+        data = load_data()
+        result = _resolve_card(data, user_id, slots)
+        if result["status"] != "ok":
+            return result
+        card = result["card"]
+        error = _validate_card_action(action, card)
+        if error:
+            return {"status": "fail", "error": f"{card['name']}: {error}"}
+        return {"status": "ok", "draft": {"card_id": card["card_id"], "to_status": rule["to"]}}
+
+    def describe(user_id: str, draft: dict) -> str:
+        card = _find_card(load_data(), user_id, draft["card_id"])
+        lines = [
+            f"[{rule['label']}]",
+            f"- 카드: {card['name']} ({card['card_id']}, {CARD_TYPE_LABELS[card['card_type']]})",
+            f"- 상태: {CARD_STATUS_LABELS[card['status']]} → {CARD_STATUS_LABELS[rule['to']]}",
+        ]
+        if rule["note"]:
+            lines.append(f"- 안내: {rule['note']}")
+        return "\n".join(lines)
+
+    def execute(user_id: str, request_id: str) -> dict:
+        data = load_data()
+        request = _find_request(data, request_id)
+        if request["status"] != "pending_approval":
+            return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+        card = _find_card(data, user_id, request["params"]["card_id"])
+        error = "카드를 찾을 수 없어요." if card is None else _validate_card_action(action, card)
+        if error:
+            _set_request_result(request, "failed", error)
+            try:
+                save_data(data)
+            except SaveError:
+                pass
+            return {"status": "failed", "message": f"처리하지 못했어요. {error}"}
+
+        before = card["status"]
+        card["status"] = rule["to"]
+        message = (
+            f"{with_eul(card['name'])} {CARD_STATUS_LABELS[rule['to']]} 상태로 바꿨어요. "
+            f"(이전: {CARD_STATUS_LABELS[before]})"
+        )
+        _set_request_result(request, "completed", message, card_id=card["card_id"], before=before)
+        try:
+            save_data(data)
+        except SaveError as e:
+            return {"status": "failed", "message": f"변경 내용을 저장하지 못해 반영되지 않았어요. ({e})"}
+        return {"status": "completed", "message": message}
+
+    return resolve, describe, execute
+
+
+# ---------------------------------------------------------------------------
 # 업무 레지스트리
 # ---------------------------------------------------------------------------
 
@@ -397,10 +600,19 @@ def _transfer_transaction(
 class Task:
     kind: str                           # "query" | "change"
     label: str                          # 사용자에게 보여줄 업무 이름
+    slots: tuple[str, ...] = ()         # LLM이 채울 슬롯 이름 (graph의 스키마 필드와 같음)
     query: Callable | None = None
     resolve: Callable | None = None
     describe: Callable | None = None
     execute: Callable | None = None
+
+
+def _card_task(action: str) -> Task:
+    resolve, describe, execute = _make_card_task(action)
+    return Task(
+        kind="change", label=CARD_ACTIONS[action]["label"], slots=("card",),
+        resolve=resolve, describe=describe, execute=execute,
+    )
 
 
 TASKS: dict[str, Task] = {
@@ -408,8 +620,13 @@ TASKS: dict[str, Task] = {
     "transfer": Task(
         kind="change",
         label="즉시이체",
+        slots=("from_account", "to_account", "amount"),
         resolve=resolve_transfer,
         describe=describe_transfer,
         execute=execute_transfer,
     ),
+    "query_cards": Task(kind="query", label="카드 조회", slots=("card",), query=query_cards),
+    "report_lost": _card_task("report_lost"),
+    "lock_card": _card_task("lock_card"),
+    "unlock_card": _card_task("unlock_card"),
 }

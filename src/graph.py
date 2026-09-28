@@ -40,36 +40,45 @@ def get_llm() -> ChatGoogleGenerativeAI:
 # LLM 출력 스키마 (설계 4절)
 # ---------------------------------------------------------------------------
 
-Intent = Literal["query_accounts", "transfer", "unknown"]
+Intent = Literal[
+    "query_accounts", "transfer",
+    "query_cards", "report_lost", "lock_card", "unlock_card",
+    "unknown",
+]
+
+INTENT_GUIDE = """\
+- query_accounts: 계좌 목록·잔액·총액 질문
+- transfer: 내 계좌 간 이체 요청
+- query_cards: 카드 목록·상태 질문
+- report_lost: 카드를 잃어버렸거나 도난당해 정지 요청 (되돌릴 수 없음)
+- lock_card: 카드를 잠깐 못 쓰게 잠그는 요청 (집에 두고 옴, 잠시 보관 등)
+- unlock_card: 잠근 카드를 다시 쓰도록 푸는 요청 (카드를 찾음 등)
+- unknown: 그 외 또는 판단 불가"""
 
 
-class ParsedRequest(BaseModel):
-    intent: Intent = Field(description=(
-        "query_accounts: 계좌 목록·잔액·총액 질문 / "
-        "transfer: 계좌 간 이체 요청 / unknown: 그 외 또는 판단 불가"
-    ))
+class Slots(BaseModel):
+    """업무별 슬롯. 필드 이름은 functions.TASKS의 Task.slots와 같다."""
     from_account: str | None = Field(None, description="출금 계좌 별명. 언급이 없으면 null")
     to_account: str | None = Field(None, description="입금 계좌 별명. 언급이 없으면 null")
     amount: int | None = Field(None, description="원 단위 정수. '10만 원' → 100000, 음수도 그대로. 언급이 없으면 null")
+    card: str | None = Field(None, description="카드 이름 또는 카드 ID. 언급이 없으면 null")
+
+
+class ParsedRequest(Slots):
+    intent: Intent = Field(description=INTENT_GUIDE)
     reason: str = Field(description="분류 근거 한 문장")
 
 
-class SlotAnswer(BaseModel):
+class SlotAnswer(Slots):
     cancel: bool = Field(description="사용자가 요청을 그만두겠다고 하면 true")
-    from_account: str | None = Field(None, description="새로 알려준 출금 계좌 별명")
-    to_account: str | None = Field(None, description="새로 알려준 입금 계좌 별명")
-    amount: int | None = Field(None, description="새로 알려준 금액 (원 단위 정수)")
-    selected_account_id: str | None = Field(None, description="후보 목록에서 고른 계좌의 account_id")
+    selected_id: str | None = Field(None, description="후보 목록에서 고른 항목의 id")
 
 
-class ApprovalReply(BaseModel):
+class ApprovalReply(Slots):
     decision: Literal["approve", "reject", "modify", "unclear"] = Field(description=(
         "approve: 진행 동의 / reject: 취소·거절 / "
-        "modify: 처리안 일부를 바꿔 달라는 요청 / unclear: 판단 불가"
+        "modify: 처리안 일부를 바꿔 달라는 요청 (바뀐 값만 채움) / unclear: 판단 불가"
     ))
-    from_account: str | None = Field(None, description="modify일 때 바뀐 출금 계좌 별명")
-    to_account: str | None = Field(None, description="modify일 때 바뀐 입금 계좌 별명")
-    amount: int | None = Field(None, description="modify일 때 바뀐 금액 (원 단위 정수)")
 
 
 # ---------------------------------------------------------------------------
@@ -105,23 +114,33 @@ TASK_FIELDS = {
 }
 
 
-def _accounts_context(user_id: str) -> str:
+def _user_context(user_id: str) -> str:
+    """LLM에 전달할 사용자의 계좌·카드 이름 목록."""
     data = load_data()
-    return "\n".join(
+    accounts = "\n".join(
         f"- {a['nickname']} ({a['account_id']})"
         for a in data["accounts"] if a["owner_id"] == user_id
     )
+    cards = "\n".join(
+        f"- {c['name']} ({c['card_id']})"
+        for c in data["cards"] if c["owner_id"] == user_id
+    )
+    return f"사용자의 계좌 목록:\n{accounts}\n사용자의 카드 목록:\n{cards}"
+
+
+def _pick_slots(model: BaseModel, intent: str) -> dict:
+    """LLM 출력에서 현재 업무가 쓰는 슬롯만 꺼낸다."""
+    return {name: getattr(model, name) for name in fn.TASKS[intent].slots}
 
 
 def _merge_slots(slots: dict, changes: dict) -> dict:
-    """새로 받은 값만 덮어쓴다. 별명이 바뀌면 이전에 고른 계좌 ID는 버린다."""
+    """새로 받은 값만 덮어쓴다. 이름이 바뀌면 이전에 후보에서 고른 ID는 버린다."""
     merged = dict(slots)
     for key, value in changes.items():
         if value is None:
             continue
         merged[key] = value
-        if key in ("from_account", "to_account"):
-            merged.pop(f"{key}_id", None)
+        merged.pop(f"{key}_id", None)
     return merged
 
 
@@ -142,8 +161,9 @@ def parse_request(state: BankState) -> dict:
     prompt = (
         "당신은 은행 앱의 요청 해석기입니다. 사용자 요청을 분류하고 필요한 값을 추출하세요.\n"
         f"오늘 날짜: {today}\n"
-        f"사용자의 계좌 목록:\n{_accounts_context(user_id)}\n"
-        "계좌 별명은 사용자가 말한 표현 그대로 추출하세요.\n\n"
+        f"{_user_context(user_id)}\n"
+        "계좌 별명과 카드 이름은 사용자가 말한 표현 그대로 추출하세요.\n"
+        "현재 업무에 필요 없는 값은 null로 두세요.\n\n"
         f"사용자 요청: {text}"
     )
     try:
@@ -151,19 +171,16 @@ def parse_request(state: BankState) -> dict:
     except Exception as e:
         return {**update, "intent": "unknown", "error": f"요청을 해석하지 못했어요. 다시 말씀해 주세요. ({type(e).__name__})"}
 
-    slots = {}
-    if parsed.intent == "transfer":
-        slots = {
-            "from_account": parsed.from_account,
-            "to_account": parsed.to_account,
-            "amount": parsed.amount,
-        }
+    slots = _pick_slots(parsed, parsed.intent) if parsed.intent in fn.TASKS else {}
     return {**update, "intent": parsed.intent, "slots": slots}
 
 
 def lookup(state: BankState) -> dict:
     task = fn.TASKS[state["intent"]]
-    return {"result": task.query(state["user_id"], state.get("slots", {}))}
+    result = task.query(state["user_id"], state.get("slots", {}))
+    if result["status"] == "fail":
+        return {"error": result["error"]}
+    return {"result": result}
 
 
 def resolve(state: BankState) -> dict:
@@ -203,7 +220,7 @@ def ask_user(state: BankState) -> dict:
         f"질문: {question}\n"
     )
     if candidates:
-        prompt += f"후보 목록(이 중에서 고르면 selected_account_id에 account_id를 넣으세요): {candidates['options']}\n"
+        prompt += f"후보 목록(이 중에서 고르면 selected_id에 해당 id를 넣으세요): {candidates['options']}\n"
     prompt += f"사용자 답변: {answer}"
 
     try:
@@ -217,13 +234,12 @@ def ask_user(state: BankState) -> dict:
             fn.cancel_request(state["request_id"])
         return {"messages": messages, "step": "cancel", "error": "요청을 취소했어요. 변경된 내용은 없어요."}
 
-    changes = {"from_account": reply.from_account, "to_account": reply.to_account, "amount": reply.amount}
-    slots = _merge_slots(state["slots"], changes)
+    slots = _merge_slots(state["slots"], _pick_slots(reply, state["intent"]))
 
-    if candidates and reply.selected_account_id:
-        valid_ids = {o["account_id"] for o in candidates["options"]}
-        if reply.selected_account_id in valid_ids:
-            slots[candidates["slot"]] = reply.selected_account_id
+    if candidates and reply.selected_id:
+        valid_ids = {o["id"] for o in candidates["options"]}
+        if reply.selected_id in valid_ids:
+            slots[candidates["slot"]] = reply.selected_id
 
     return {"messages": messages, "slots": slots, "step": None}
 
@@ -273,7 +289,7 @@ def confirm(state: BankState) -> dict:
     if reply.decision == "reject":
         return {**base, "result": fn.cancel_request(state["request_id"])}
     if reply.decision == "modify":
-        changes = {"from_account": reply.from_account, "to_account": reply.to_account, "amount": reply.amount}
+        changes = _pick_slots(reply, state["intent"])
         if any(v is not None for v in changes.values()):
             return {
                 **base,
@@ -323,11 +339,14 @@ def _format_response(state: BankState) -> str:
     if intent == "query_accounts":
         lines = [f"- {a['nickname']} ({a['account_id']}): {fn.won(a['balance'])}" for a in result["accounts"]]
         return "계좌 목록이에요.\n" + "\n".join(lines) + f"\n총 잔액: {fn.won(result['total'])}"
+    if intent == "query_cards":
+        lines = [f"- {c['name']} ({c['card_id']}, {c['card_type']}): {c['status']}" for c in result["cards"]]
+        return "카드 목록이에요.\n" + "\n".join(lines)
     if intent in fn.TASKS and result.get("message"):
         return result["message"]
     return (
-        "지금은 계좌 조회와 계좌 간 이체를 도와드릴 수 있어요.\n"
-        "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘'"
+        "지금은 계좌 조회·이체와 카드 조회·분실 정지·잠금·잠금 해제를 도와드릴 수 있어요.\n"
+        "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘', '생활비 카드 잃어버렸어'"
     )
 
 
