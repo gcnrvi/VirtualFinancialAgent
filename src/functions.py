@@ -963,6 +963,348 @@ def _save_result(data: dict, message: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 청구서·납부 (설계 6-4)
+# ---------------------------------------------------------------------------
+
+BILL_ITEM_LABELS = {"completed": "완료", "failed": "실패(미납 유지)", "unprocessed": "미처리(미납 유지)"}
+
+
+def _user_bills(data: dict, user_id: str) -> list[dict]:
+    return [b for b in data["bills"] if b["owner_id"] == user_id]
+
+
+def _find_bill(data: dict, user_id: str, bill_id: str) -> dict | None:
+    return next((b for b in _user_bills(data, user_id) if b["bill_id"] == bill_id), None)
+
+
+def _by_due(bills: list[dict]) -> list[dict]:
+    return sorted(bills, key=lambda b: (b["due_date"], b["bill_id"]))
+
+
+def _due_note(bill: dict) -> str:
+    """납기일 표시. 기한이 지났으면 연체료 없이 납부할 수 있다고 덧붙인다."""
+    if bill["due_date"] < today_kst():
+        return f"{bill['due_date']}, 기한 지남·연체료 없음"
+    return bill["due_date"]
+
+
+def match_bills(data: dict, user_id: str, name: str) -> list[dict]:
+    """청구서 이름(또는 ID)으로 내 청구서를 찾는다. 정확히 일치하면 그것만, 아니면 부분 일치."""
+    bills = _user_bills(data, user_id)
+    by_id = [b for b in bills if b["bill_id"] == name.strip()]
+    if by_id:
+        return by_id
+    key = re.sub(r"\s+", "", name)
+    exact = [b for b in bills if re.sub(r"\s+", "", b["name"]) == key]
+    return exact or [b for b in bills if key and key in re.sub(r"\s+", "", b["name"])]
+
+
+def _bill_brief(bill: dict) -> dict:
+    return {
+        "bill_id": bill["bill_id"],
+        "name": bill["name"],
+        "amount": bill["amount"],
+        "due": _due_note(bill),
+    }
+
+
+def query_bills(user_id: str, slots: dict | None = None) -> dict:
+    """미납 청구서를 납기일순으로 돌려준다."""
+    data = load_data()
+    unpaid = _by_due([b for b in _user_bills(data, user_id) if b["status"] == "unpaid"])
+    return {
+        "status": "ok",
+        "bills": [_bill_brief(b) for b in unpaid],
+        "total": sum(b["amount"] for b in unpaid),
+    }
+
+
+def _bill_payment(data: dict, user_id: str, account: dict, bill: dict, now: str) -> str:
+    """청구서 한 건을 메모리의 data에 반영하고 거래 ID를 돌려준다. (저장은 호출한 쪽에서)"""
+    account["balance"] -= bill["amount"]
+    transaction_id = _next_id(data["transactions"], "transaction_id", "tx")
+    data["transactions"].append({
+        "transaction_id": transaction_id,
+        "owner_id": user_id,
+        "account_id": account["account_id"],
+        "type": "withdrawal",
+        "amount": bill["amount"],
+        "occurred_at": now,
+        "card_id": None,
+        "merchant": bill["name"],
+    })
+    bill.update({
+        "status": "paid",
+        "paid_at": now,
+        "paid_account_id": account["account_id"],
+        "transaction_id": transaction_id,
+    })
+    return transaction_id
+
+
+def _bill_unpayable_reason(bill: dict | None, account: dict | None) -> str | None:
+    if bill is None:
+        return "청구서를 찾을 수 없어요."
+    if bill["status"] != "unpaid":
+        return f"{with_eun(bill['name'])} 이미 납부한 청구서예요."
+    if account is None:
+        return "출금 계좌를 찾을 수 없어요."
+    if account["balance"] < bill["amount"]:
+        return (
+            f"{account['nickname']} 잔액({won(account['balance'])})이 "
+            f"{bill['name']} 금액({won(bill['amount'])})보다 적어요."
+        )
+    return None
+
+
+# ---- 청구서 한 건 납부 --------------------------------------------------------
+
+def resolve_pay_bill(user_id: str, slots: dict) -> dict:
+    """청구서 → 출금 계좌 → 미납 여부 → 잔액 순서로 검증한다."""
+    data = load_data()
+    unpaid = _by_due([b for b in _user_bills(data, user_id) if b["status"] == "unpaid"])
+
+    # 청구서 확정
+    bill = _find_bill(data, user_id, slots["bill_id"]) if slots.get("bill_id") else None
+    if bill is None:
+        name = slots.get("bill")
+        matches = match_bills(data, user_id, name) if name else []
+        if name and not matches:
+            return {"status": "fail", "error": f"'{name}' 청구서를 찾을 수 없어요."}
+        if len(matches) == 1:
+            bill = matches[0]
+        else:
+            options = [
+                {"id": b["bill_id"], "label": f"{b['name']} {won(b['amount'])} (납기 {b['due_date']})"}
+                for b in (_by_due(matches) if matches else unpaid)
+            ]
+            if not options:
+                return {"status": "fail", "error": "납부할 미납 청구서가 없어요."}
+            lines = [f"{i}) {o['label']}" for i, o in enumerate(options, 1)]
+            return {
+                "status": "ask",
+                "question": "어떤 청구서를 납부할까요?\n" + "\n".join(lines),
+                "missing": [] if name else ["bill"],
+                "candidates": {"slot": "bill_id", "options": options},
+            }
+
+    if bill["status"] != "unpaid":
+        return {"status": "fail", "error": f"{with_eun(bill['name'])} 이미 납부한 청구서예요."}
+
+    # 출금 계좌 확정
+    if not slots.get("from_account") and not slots.get("from_account_id"):
+        return {
+            "status": "ask",
+            "question": f"{bill['name']} {won(bill['amount'])}을 어느 계좌에서 낼까요?\n"
+            + "\n".join(f"- {a['nickname']} (잔액 {won(a['balance'])})" for a in _user_accounts(data, user_id)),
+            "missing": ["from_account"],
+            "candidates": None,
+        }
+    result = _resolve_account_slot(data, user_id, slots, "from_account", "출금 계좌")
+    if result["status"] != "ok":
+        return result
+
+    error = _bill_unpayable_reason(bill, result["account"])
+    if error:
+        return {"status": "fail", "error": error}
+    return {
+        "status": "ok",
+        "draft": {"from_account_id": result["account"]["account_id"], "bill_id": bill["bill_id"]},
+    }
+
+
+def describe_pay_bill(user_id: str, draft: dict) -> str:
+    data = load_data()
+    account = _find_account(data, user_id, draft["from_account_id"])
+    bill = _find_bill(data, user_id, draft["bill_id"])
+    return (
+        "[청구서 납부]\n"
+        f"- 청구서: {bill['name']} ({bill['bill_id']}, 납기 {_due_note(bill)})\n"
+        f"- 금액: {won(bill['amount'])} (전액 납부)\n"
+        f"- 출금: {account['nickname']} ({account['account_id']})\n"
+        f"- 납부 후 {account['nickname']} 잔액: {won(account['balance'] - bill['amount'])}"
+    )
+
+
+def execute_pay_bill(user_id: str, request_id: str) -> dict:
+    """잔액·출금 거래·청구서 상태·요청 기록을 한 번에 저장한다."""
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    account = _find_account(data, user_id, draft["from_account_id"])
+    bill = _find_bill(data, user_id, draft["bill_id"])
+    error = _bill_unpayable_reason(bill, account)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    transaction_id = _bill_payment(data, user_id, account, bill, now_kst())
+    message = (
+        f"{bill['name']} {won(bill['amount'])}을 {account['nickname']}에서 납부했어요. "
+        f"{account['nickname']} 잔액은 {won(account['balance'])}이에요."
+    )
+    _set_request_result(request, "completed", message, transaction_ids=[transaction_id])
+    return _save_result(data, message)
+
+
+# ---- 일괄 납부 ----------------------------------------------------------------
+
+def resolve_pay_bills_batch(user_id: str, slots: dict) -> dict:
+    """출금 계좌 → 대상 청구서(이름 목록 또는 전부) → 미납 1건 이상 순서로 검증한다.
+
+    총액이 잔액보다 커도 승인은 받는다. 잔액이 부족한 건은 실행 중에 미납으로 남긴다.
+    """
+    data = load_data()
+    if not slots.get("from_account") and not slots.get("from_account_id"):
+        return {"status": "ask", "question": "어느 계좌에서 납부할까요?", "missing": ["from_account"], "candidates": None}
+    result = _resolve_account_slot(data, user_id, slots, "from_account", "출금 계좌")
+    if result["status"] != "ok":
+        return result
+    account = result["account"]
+
+    unpaid_all = [b for b in _user_bills(data, user_id) if b["status"] == "unpaid"]
+    names = slots.get("bills") or []
+    if slots.get("all_bills"):
+        selected = unpaid_all
+    elif names:
+        selected = []
+        for name in names:
+            matches = match_bills(data, user_id, name)
+            if not matches:
+                return {"status": "fail", "error": f"'{name}' 청구서를 찾을 수 없어요."}
+            if len(matches) > 1:
+                labels = ", ".join(b["name"] for b in matches)
+                return {"status": "fail", "error": f"'{name}'에 해당하는 청구서가 여러 개예요. ({labels}) 이름을 정확히 알려주세요."}
+            selected.append(matches[0])
+    else:
+        lines = [f"- {b['name']} {won(b['amount'])} (납기 {b['due_date']})" for b in _by_due(unpaid_all)]
+        return {
+            "status": "ask",
+            "question": "어떤 청구서를 납부할까요? '전부' 또는 청구서 이름을 알려주세요.\n" + "\n".join(lines),
+            "missing": ["bills"],
+            "candidates": None,
+        }
+
+    # 이미 납부한 청구서는 다시 처리하지 않는다.
+    selected = _by_due({b["bill_id"]: b for b in selected if b["status"] == "unpaid"}.values())
+    if not selected:
+        return {"status": "fail", "error": "선택한 청구서는 모두 이미 납부했어요. 납부할 미납 청구서가 없어요."}
+    return {
+        "status": "ok",
+        "draft": {"from_account_id": account["account_id"], "bill_ids": [b["bill_id"] for b in selected]},
+    }
+
+
+def describe_pay_bills_batch(user_id: str, draft: dict) -> str:
+    data = load_data()
+    account = _find_account(data, user_id, draft["from_account_id"])
+    bills = [_find_bill(data, user_id, bid) for bid in draft["bill_ids"]]
+    total = sum(b["amount"] for b in bills)
+    lines = [f"  {i}. {b['name']} {won(b['amount'])} (납기 {_due_note(b)})" for i, b in enumerate(bills, 1)]
+    text = (
+        "[청구서 일괄 납부]\n"
+        f"- 출금: {account['nickname']} ({account['account_id']}, 잔액 {won(account['balance'])})\n"
+        "- 납부 순서 (납기일 빠른 순):\n" + "\n".join(lines) + "\n"
+        f"- 총액: {won(total)} ({len(bills)}건)"
+    )
+    if total > account["balance"]:
+        text += "\n- 안내: 잔액이 총액보다 적어요. 순서대로 납부하다 잔액이 부족한 건은 미납으로 남겨요."
+    return text
+
+
+def execute_pay_bills_batch(user_id: str, request_id: str) -> dict:
+    """납기일이 빠른 청구서부터 건별로 처리·저장한다.
+
+    - 잔액 부족·이미 납부: 실패로 기록하고 다음 건으로 진행
+    - 저장 실패: 해당 건은 미반영(실패), 남은 건은 미처리로 두고 중단. 이미 저장된 납부는 유지
+    - 건별 저장에 요청의 진행 기록(result.items)을 함께 저장한다. 요청 상태는 끝날 때 갱신한다.
+    """
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    # 재시작 후 다시 승인받아 실행하는 경우, 이전에 저장된 완료 건은 결과에 그대로 남긴다.
+    items = [i for i in ((request.get("result") or {}).get("items") or []) if i["status"] == "completed"]
+    bill_ids = _by_due_ids(data, user_id, draft["bill_ids"])
+
+    stopped = False
+    for index, bill_id in enumerate(bill_ids):
+        bill = _find_bill(data, user_id, bill_id)
+        account = _find_account(data, user_id, draft["from_account_id"])
+        reason = _bill_unpayable_reason(bill, account)
+        if reason:
+            items.append(_bill_item(bill, bill_id, "failed", reason))
+            continue
+
+        transaction_id = _bill_payment(data, user_id, account, bill, now_kst())
+        item = _bill_item(bill, bill_id, "completed", None, transaction_id)
+        request["result"] = {"message": "일괄 납부 진행 중", "items": [*items, item]}
+        request["updated_at"] = now_kst()
+        try:
+            save_data(data)
+        except SaveError as e:
+            # 저장하지 못한 건은 반영하지 않는다. 파일 기준으로 다시 읽어 메모리 변경을 버린다.
+            data = load_data()
+            request = _find_request(data, request_id)
+            items.append(_bill_item(bill, bill_id, "failed", f"저장 실패로 반영되지 않음 ({e})"))
+            for rest_id in bill_ids[index + 1:]:
+                items.append(_bill_item(_find_bill(data, user_id, rest_id), rest_id, "unprocessed", "저장 실패로 처리 중단"))
+            stopped = True
+            break
+        items.append(item)
+
+    completed = [i for i in items if i["status"] == "completed"]
+    status = "completed" if len(completed) == len(items) else ("partial" if completed else "failed")
+    account = _find_account(data, user_id, draft["from_account_id"])
+    message = _batch_message(items, account, stopped)
+    _set_request_result(request, status, message, items=items)
+    try:
+        save_data(data)
+    except SaveError:
+        # 최종 상태를 못 남겨도 건별 납부는 이미 저장되어 있다. 요청은 pending_approval로 남아
+        # 재시작 시 남은 청구서만 다시 승인받는다.
+        message += "\n(처리 결과 기록을 저장하지 못했어요.)"
+    return {"status": status if status != "partial" else "completed", "message": message, "items": items}
+
+
+def _by_due_ids(data: dict, user_id: str, bill_ids: list[str]) -> list[str]:
+    bills = [b for b in (_find_bill(data, user_id, bid) for bid in bill_ids) if b]
+    ordered = [b["bill_id"] for b in _by_due(bills)]
+    return ordered + [bid for bid in bill_ids if bid not in ordered]
+
+
+def _bill_item(bill: dict | None, bill_id: str, status: str, reason: str | None, transaction_id: str | None = None) -> dict:
+    return {
+        "bill_id": bill_id,
+        "name": bill["name"] if bill else bill_id,
+        "amount": bill["amount"] if bill else 0,
+        "status": status,
+        "reason": reason,
+        "transaction_id": transaction_id,
+    }
+
+
+def _batch_message(items: list[dict], account: dict, stopped: bool) -> str:
+    lines = ["청구서 일괄 납부 결과예요."]
+    for status, label in BILL_ITEM_LABELS.items():
+        group = [i for i in items if i["status"] == status]
+        if not group:
+            continue
+        total = sum(i["amount"] for i in group)
+        lines.append(f"- {label} {len(group)}건 ({won(total)})")
+        for i in group:
+            lines.append(f"  · {i['name']} {won(i['amount'])}" + (f": {i['reason']}" if i["reason"] and status != "completed" else ""))
+    if stopped:
+        lines.append("저장 오류로 처리를 중단했어요. 이미 납부한 건은 그대로 유지돼요.")
+    lines.append(f"{account['nickname']} 잔액: {won(account['balance'])}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 업무 레지스트리
 # ---------------------------------------------------------------------------
 
@@ -1013,6 +1355,15 @@ TASKS: dict[str, Task] = {
     "cancel_reissue": Task(
         kind="change", label="재발급 신청 취소", slots=("card", "application"),
         resolve=resolve_cancel_reissue, describe=describe_cancel_reissue, execute=execute_cancel_reissue,
+    ),
+    "query_bills": Task(kind="query", label="미납 청구서 조회", query=query_bills),
+    "pay_bill": Task(
+        kind="change", label="청구서 납부", slots=("from_account", "bill"),
+        resolve=resolve_pay_bill, describe=describe_pay_bill, execute=execute_pay_bill,
+    ),
+    "pay_bills_batch": Task(
+        kind="change", label="청구서 일괄 납부", slots=("from_account", "bills", "all_bills"),
+        resolve=resolve_pay_bills_batch, describe=describe_pay_bills_batch, execute=execute_pay_bills_batch,
     ),
 }
 

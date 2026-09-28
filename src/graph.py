@@ -46,6 +46,7 @@ Intent = Literal[
     "query_accounts", "transfer",
     "query_cards", "report_lost", "lock_card", "unlock_card",
     "reissue_card", "lost_and_reissue", "query_reissue", "modify_reissue", "cancel_reissue",
+    "query_bills", "pay_bill", "pay_bills_batch",
     "unknown",
 ]
 
@@ -61,6 +62,9 @@ INTENT_GUIDE = """\
 - query_reissue: 재발급 신청의 상태·배송지 조회
 - modify_reissue: 재발급 신청의 배송지 변경
 - cancel_reissue: 재발급 신청 취소
+- query_bills: 미납(아직 안 낸) 청구서 조회
+- pay_bill: 청구서 한 건 납부
+- pay_bills_batch: 청구서 여러 건 또는 전부 납부
 - unknown: 그 외 또는 판단 불가"""
 
 
@@ -72,6 +76,9 @@ class Slots(BaseModel):
     card: str | None = Field(None, description="카드 이름 또는 카드 ID. 언급이 없으면 null")
     address: Literal["집", "회사"] | None = Field(None, description="재발급 카드 배송지. 언급이 없으면 null")
     application: str | None = Field(None, description="재발급 신청 ID (예: rei-001). 언급이 없으면 null")
+    bill: str | None = Field(None, description="납부할 청구서 하나의 이름 (예: 전기요금). 언급이 없으면 null")
+    bills: list[str] | None = Field(None, description="일괄 납부할 청구서 이름 목록. 언급이 없으면 null")
+    all_bills: bool | None = Field(None, description="미납 청구서 '전부'를 납부하라는 요청이면 true")
 
 
 class ParsedRequest(Slots):
@@ -143,9 +150,13 @@ def _user_context(user_id: str) -> str:
         f"- {a['application_id']} ({a['card_id']}, {fn.APPLICATION_STATUS_LABELS[a['status']]})"
         for a in data["reissue_applications"] if a["owner_id"] == user_id
     ) or "- 없음"
+    bills = "\n".join(
+        f"- {b['name']} ({b['bill_id']}, {'미납' if b['status'] == 'unpaid' else '납부 완료'})"
+        for b in data["bills"] if b["owner_id"] == user_id
+    )
     return (
         f"사용자의 계좌 목록:\n{accounts}\n사용자의 카드 목록:\n{cards}\n"
-        f"사용자의 재발급 신청 목록:\n{applications}"
+        f"사용자의 재발급 신청 목록:\n{applications}\n사용자의 청구서 목록:\n{bills}"
     )
 
 
@@ -443,10 +454,18 @@ def _format_response(state: BankState) -> str:
             f"재발급 신청 {a['application_id']}\n- 카드: {a['card']}\n- 배송지: {a['address']}\n"
             f"- 상태: {a['status']}\n- 신청일: {a['created_at']}"
         )
+    if intent == "query_bills":
+        if not result["bills"]:
+            return "미납 청구서가 없어요."
+        lines = [f"- {b['name']}: {fn.won(b['amount'])} (납기 {b['due']})" for b in result["bills"]]
+        return (
+            f"미납 청구서 {len(lines)}건이에요.\n" + "\n".join(lines)
+            + f"\n합계: {fn.won(result['total'])}"
+        )
     if intent in fn.TASKS and result.get("message"):
         return result["message"]
     return (
-        "지금은 계좌 조회·이체, 카드 조회·분실 정지·잠금·해제, 카드 재발급 신청·조회·변경·취소를 도와드릴 수 있어요.\n"
+        "지금은 계좌 조회·이체, 카드 조회·분실 정지·잠금·해제, 카드 재발급 신청·조회·변경·취소, 청구서 조회·납부를 도와드릴 수 있어요.\n"
         "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘', '생활비 카드 잃어버렸어. 정지하고 재발급해줘'"
     )
 
