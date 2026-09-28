@@ -255,6 +255,7 @@ def query_accounts(user_id: str, slots: dict | None = None) -> dict:
         "status": "ok",
         "accounts": accounts,
         "total": sum(a["balance"] for a in accounts),
+        "targets": {"accounts": [a["account_id"] for a in accounts]},
     }
 
 
@@ -504,14 +505,21 @@ def _card_brief(card: dict) -> dict:
 def query_cards(user_id: str, slots: dict | None = None) -> dict:
     """카드 이름·ID·종류·상태를 돌려준다. 카드 이름이 있으면 해당 카드만 보여준다."""
     data = load_data()
+    slots = slots or {}
     cards = _user_cards(data, user_id)
-    name = (slots or {}).get("card")
-    if name:
+    name = slots.get("card")
+    if slots.get("card_id"):
+        cards = [c for c in cards if c["card_id"] == slots["card_id"]]
+    elif name:
         matches, _ = match_cards(data, user_id, name)
         if not matches:
             return {"status": "fail", "error": f"'{name}' 카드를 찾을 수 없어요."}
         cards = matches
-    return {"status": "ok", "cards": [_card_brief(c) for c in cards]}
+    return {
+        "status": "ok",
+        "cards": [_card_brief(c) for c in cards],
+        "targets": {"cards": [c["card_id"] for c in cards]},
+    }
 
 
 def _resolve_card(data: dict, user_id: str, slots: dict) -> dict:
@@ -713,7 +721,11 @@ def _resolve_application(data: dict, user_id: str, slots: dict, include_cancelle
         return {"status": "ok", "application": match}
 
     card_name = slots.get("card")
-    if card_name:
+    if slots.get("card_id"):
+        applications = [a for a in applications if a["card_id"] == slots["card_id"]]
+        card = _find_card(data, user_id, slots["card_id"])
+        card_name = card["name"] if card else slots["card_id"]
+    elif card_name:
         cards, _ = match_cards(data, user_id, card_name)
         card_ids = {c["card_id"] for c in cards}
         applications = [a for a in applications if a["card_id"] in card_ids]
@@ -827,7 +839,12 @@ def query_reissue(user_id: str, slots: dict | None = None) -> dict:
     result = _resolve_application(data, user_id, slots or {}, include_cancelled=True)
     if result["status"] != "ok":
         return result
-    return {"status": "ok", "application": _application_brief(data, result["application"])}
+    application = result["application"]
+    return {
+        "status": "ok",
+        "application": _application_brief(data, application),
+        "targets": {"applications": [application["application_id"]], "cards": [application["card_id"]]},
+    }
 
 
 # ---- 재발급 수정·취소 -------------------------------------------------------
@@ -1019,6 +1036,7 @@ def query_bills(user_id: str, slots: dict | None = None) -> dict:
         "status": "ok",
         "bills": [_bill_brief(b) for b in unpaid],
         "total": sum(b["amount"] for b in unpaid),
+        "targets": {"bills": [b["bill_id"] for b in unpaid]},
     }
 
 
@@ -1417,6 +1435,7 @@ def query_transactions(user_id: str, slots: dict | None = None) -> dict:
 
     return {
         "status": "ok",
+        "targets": {"accounts": [account["account_id"]]} if account else {},
         "filters": ", ".join(filters),
         "transactions": rows,
         "deposit_total": sum(r["amount"] for r in rows if r["sign"] > 0),
@@ -1736,6 +1755,225 @@ def execute_rename_account(user_id: str, request_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 후속 결과 조회·대화 대상 (설계 6-5)
+# ---------------------------------------------------------------------------
+
+REQUEST_STATUS_LABELS = {
+    "pending_approval": "승인 대기",
+    "completed": "완료",
+    "partial": "일부 완료",
+    "cancelled": "취소",
+    "failed": "실패",
+}
+
+# 사용자가 말하는 업무 종류 → 요청 type
+REQUEST_KINDS = {
+    "transfer": {"transfer", "conditional_transfer", "multi_transfer"},
+    "card": {"report_lost", "lock_card", "unlock_card"},
+    "reissue": {"reissue_card", "modify_reissue", "cancel_reissue"},
+    "bill": {"pay_bill", "pay_bills_batch"},
+    "account": {"rename_account"},
+}
+REQUEST_KIND_LABELS = {"transfer": "이체", "card": "카드", "reissue": "재발급", "bill": "납부", "account": "계좌 별명 변경"}
+
+PARAM_LABELS = {
+    "from_account_id": "출금 계좌", "to_account_id": "입금 계좌", "account_id": "계좌",
+    "card_id": "카드", "address_id": "배송지", "application_id": "재발급 신청",
+    "bill_id": "청구서", "bill_ids": "청구서", "amount": "금액", "keep_amount": "남길 금액",
+    "new_nickname": "새 별명", "items": "입금", "to_status": "변경 상태",
+}
+
+# 대상 종류 → (데이터 키, ID 필드, 이름 필드)
+TARGET_KINDS = {
+    "accounts": ("accounts", "account_id", "nickname"),
+    "cards": ("cards", "card_id", "name"),
+    "bills": ("bills", "bill_id", "name"),
+    "applications": ("reissue_applications", "application_id", "application_id"),
+}
+
+
+def _name_of(data: dict, kind: str, item_id: str) -> str:
+    key, id_field, name_field = TARGET_KINDS[kind]
+    item = next((x for x in data[key] if x[id_field] == item_id), None)
+    return item[name_field] if item else item_id
+
+
+def _summarize_params(data: dict, params: dict) -> str:
+    """요청 params의 ID를 이름으로 바꿔 한 줄로 요약한다."""
+    parts = []
+    for key, value in params.items():
+        label = PARAM_LABELS.get(key, key)
+        if key in ("from_account_id", "to_account_id", "account_id"):
+            value = _name_of(data, "accounts", value)
+        elif key == "card_id":
+            value = _name_of(data, "cards", value)
+        elif key == "bill_id":
+            value = _name_of(data, "bills", value)
+        elif key == "bill_ids":
+            value = ", ".join(_name_of(data, "bills", b) for b in value)
+        elif key == "address_id":
+            value = next((a["label"] for a in data["addresses"] if a["address_id"] == value), value)
+        elif key in ("amount", "keep_amount"):
+            value = won(value)
+        elif key == "to_status":
+            value = CARD_STATUS_LABELS.get(value, value)
+        elif key == "items":
+            value = ", ".join(f"{_name_of(data, 'accounts', i['to_account_id'])} {won(i['amount'])}" for i in value)
+        parts.append(f"{label} {value}")
+    return " / ".join(parts)
+
+
+def _request_option(data: dict, request: dict) -> dict:
+    task = TASKS.get(request["type"])
+    label = (
+        f"{task.label if task else request['type']} · {REQUEST_STATUS_LABELS.get(request['status'], request['status'])}"
+        f" · {request['created_at'][:16].replace('T', ' ')} · {_summarize_params(data, request['params'])}"
+    )
+    return {"id": request["request_id"], "label": label}
+
+
+def query_request_status(user_id: str, slots: dict | None = None) -> dict:
+    """이전 요청의 처리 결과를 찾는다.
+
+    우선순위: 요청 ID 지정 > 대화 중 마지막 요청(업무 종류가 맞을 때) > 종류가 맞는 요청이 1건
+    후보가 여러 개면 최근 5건에서 선택받는다.
+    earlier_request("그 전에 한 이체는?")이면 대화 중 마지막 요청과 그 이후 요청은 제외한다.
+    """
+    slots = slots or {}
+    data = load_data()
+    requests = sorted(
+        (r for r in data["requests"] if r["owner_id"] == user_id),
+        key=lambda r: (r["created_at"], r["request_id"]),
+        reverse=True,
+    )
+
+    chosen_id = slots.get("request_id") or slots.get("request")
+    kind = slots.get("request_kind")
+    types = REQUEST_KINDS.get(kind)
+    candidates = [r for r in requests if types is None or r["type"] in types]
+    context_id = slots.get("context_request_id")
+    if slots.get("earlier_request") and context_id:
+        context = next((r for r in requests if r["request_id"] == context_id), None)
+        if context:
+            candidates = [
+                r for r in candidates
+                if (r["created_at"], r["request_id"]) < (context["created_at"], context["request_id"])
+            ]
+        context_id = None
+
+    request = None
+    if chosen_id:
+        request = next((r for r in requests if r["request_id"] == chosen_id.strip()), None)
+        if request is None:
+            return {"status": "fail", "error": f"요청 {chosen_id} 기록이 없어요."}
+    elif not candidates:
+        target = f"{REQUEST_KIND_LABELS[kind]} " if kind else ""
+        return {"status": "fail", "error": f"{target}요청 기록이 없어요."}
+    elif context_id in {r["request_id"] for r in candidates}:
+        request = next(r for r in candidates if r["request_id"] == context_id)
+    elif len(candidates) == 1:
+        request = candidates[0]
+    else:
+        options = [_request_option(data, r) for r in candidates[:5]]
+        lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
+        target = f"{REQUEST_KIND_LABELS[kind]} " if kind else ""
+        return {
+            "status": "ask",
+            "question": f"어떤 {target}요청을 말씀하시는 건가요? (최근순)\n" + "\n".join(lines),
+            "missing": [],
+            "candidates": {"slot": "request_id", "options": options},
+        }
+
+    task = TASKS.get(request["type"])
+    return {
+        "status": "ok",
+        "request": {
+            "request_id": request["request_id"],
+            "label": task.label if task else request["type"],
+            "status": REQUEST_STATUS_LABELS.get(request["status"], request["status"]),
+            "created_at": request["created_at"][:16].replace("T", " "),
+            "summary": _summarize_params(data, request["params"]),
+            "message": (request.get("result") or {}).get("message"),
+        },
+        "targets": {"request": request["request_id"]},
+    }
+
+
+def close_orphan_requests(user_id: str, keep_request_id: str | None) -> list[str]:
+    """대화에서 이어갈 수 없는 승인 대기 요청을 정리한다. (재시작 복구)
+
+    예: 일괄 납부의 최종 기록 저장이 실패해 요청만 pending_approval로 남은 경우.
+    새 승인 없이 실행하지 않고, 처리가 끝나지 않았다고 기록한 뒤 안내 문장을 돌려준다.
+    이미 저장된 건별 납부가 있으면 partial, 없으면 failed로 남긴다.
+    """
+    data = load_data()
+    notes = []
+    for request in data["requests"]:
+        if request["owner_id"] != user_id or request["status"] != "pending_approval":
+            continue
+        if request["request_id"] == keep_request_id:
+            continue
+        items = (request.get("result") or {}).get("items") or []
+        done = [i for i in items if i["status"] == "completed"]
+        status = "partial" if done else "failed"
+        message = "프로그램이 중단되어 처리가 끝나지 않았어요. 남은 내용은 다시 요청해 주세요."
+        extra = {"items": items} if items else {}
+        _set_request_result(request, status, message, **extra)
+        task = TASKS.get(request["type"])
+        label = task.label if task else request["type"]
+        note = f"- {label} ({request['request_id']}): {_summarize_params(data, request['params'])}"
+        if done:
+            note += f" → 완료된 {len(done)}건({', '.join(i['name'] for i in done)})은 유지돼요."
+        notes.append(note)
+    if notes:
+        try:
+            save_data(data)
+        except SaveError:
+            pass
+    return notes
+
+
+def targets_from(draft: dict | None, result: dict | None) -> dict:
+    """업무에서 다룬 대상을 종류별 ID 목록으로 모은다. (last_targets 갱신용)"""
+    targets: dict[str, list] = {}
+
+    def add(kind: str, item_id: str | None):
+        if item_id and item_id not in targets.setdefault(kind, []):
+            targets[kind].append(item_id)
+
+    for key, value in (draft or {}).items():
+        if key in ("from_account_id", "to_account_id", "account_id"):
+            add("accounts", value)
+        elif key == "card_id":
+            add("cards", value)
+        elif key == "bill_id":
+            add("bills", value)
+        elif key == "bill_ids":
+            for v in value:
+                add("bills", v)
+        elif key == "application_id":
+            add("applications", value)
+        elif key == "items":
+            for item in value:
+                add("accounts", item["to_account_id"])
+    for kind, value in ((result or {}).get("targets") or {}).items():
+        if kind == "request":
+            targets["request"] = value
+        else:
+            for v in value:
+                add(kind, v)
+    return targets
+
+
+def target_options(user_id: str, kind: str, ids: list[str]) -> list[dict]:
+    """대상 확인 질문의 후보. ids가 비어 있으면 사용자의 해당 종류 전체."""
+    data = load_data()
+    key, id_field, name_field = TARGET_KINDS[kind]
+    items = [x for x in data[key] if x["owner_id"] == user_id and (not ids or x[id_field] in ids)]
+    return [{"id": x[id_field], "label": x[name_field]} for x in items]
+
+
+# ---------------------------------------------------------------------------
 # 업무 레지스트리
 # ---------------------------------------------------------------------------
 
@@ -1788,6 +2026,11 @@ TASKS: dict[str, Task] = {
         resolve=resolve_cancel_reissue, describe=describe_cancel_reissue, execute=execute_cancel_reissue,
     ),
     "query_bills": Task(kind="query", label="미납 청구서 조회", query=query_bills),
+    "query_request_status": Task(
+        kind="query", label="처리 결과 조회",
+        slots=("request_kind", "request", "earlier_request", "context_request_id"),
+        query=query_request_status,
+    ),
     "query_transactions": Task(
         kind="query", label="거래 내역 조회",
         slots=("account", "period", "start_date", "end_date", "min_amount", "max_amount", "tx_type"),

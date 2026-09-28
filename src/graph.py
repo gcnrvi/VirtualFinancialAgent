@@ -49,6 +49,7 @@ Intent = Literal[
     "reissue_card", "lost_and_reissue", "query_reissue", "modify_reissue", "cancel_reissue",
     "query_bills", "pay_bill", "pay_bills_batch",
     "query_transactions", "conditional_transfer", "multi_transfer", "rename_account",
+    "query_request_status",
     "unknown",
 ]
 
@@ -59,6 +60,7 @@ INTENT_GUIDE = """\
 - multi_transfer: 한 출금 계좌에서 여러 입금 계좌로 각각 금액을 정해 이체
 - rename_account: 계좌 별명(이름) 변경
 - query_transactions: 거래 내역 조회 (입금·출금·결제 내역, 기간·금액 조건)
+- query_request_status: 이전에 요청한 업무가 처리됐는지 확인 (예: 아까 이체 됐어?, 방금 정지한 거 어떻게 됐어?)
 - query_cards: 카드 목록·상태 질문
 - report_lost: 카드를 잃어버렸거나 도난당해 정지 요청 (되돌릴 수 없음)
 - lock_card: 카드를 잠깐 못 쓰게 잠그는 요청 (집에 두고 옴, 잠시 보관 등)
@@ -101,6 +103,12 @@ class Slots(BaseModel):
     end_date: str | None = Field(None, description="custom 기간의 종료일 YYYY-MM-DD")
     min_amount: int | None = Field(None, description="거래 금액 하한 (예: 5만 원 이상 → 50000)")
     max_amount: int | None = Field(None, description="거래 금액 상한")
+    request_kind: Literal["transfer", "card", "reissue", "bill", "account"] | None = Field(None, description=(
+        "처리 결과를 물어본 업무 종류. transfer: 이체 / card: 카드 정지·잠금·해제 / "
+        "reissue: 재발급 / bill: 청구서 납부 / account: 계좌 별명 변경"
+    ))
+    request: str | None = Field(None, description="요청 ID (예: req-003). 언급이 없으면 null")
+    earlier_request: bool | None = Field(None, description="직전 요청이 아니라 '그 전에', '처음에' 한 요청을 물으면 true")
     tx_type: Literal["deposit", "withdrawal", "card_payment"] | None = Field(
         None, description="deposit: 입금 / withdrawal: 출금(카드 결제 포함) / card_payment: 카드로 결제한 지출"
     )
@@ -110,9 +118,16 @@ class Slots(BaseModel):
 # 채우는 경우가 있었다 (같은 요청 30회 중 5회 → 앞에 두니 0회). 다중 상속 시 뒤쪽 부모의
 # 필드가 먼저 오므로 (Slots, 판단 필드) 순서로 상속한다.
 
+ReferencedSlot = Literal["card", "account", "from_account", "to_account", "bill", "application"]
+
+
 class _RequestHead(BaseModel):
     intent: Intent = Field(description=INTENT_GUIDE)
     reason: str = Field(description="분류 근거 한 문장")
+    referenced_slot: ReferencedSlot | None = Field(None, description=(
+        "대상을 이름 없이 '그 카드', '아까 그 계좌', '그거'처럼 이전 대화로 가리키면 그 슬롯 이름. "
+        "이때 해당 슬롯 값은 추측하지 말고 null로 둔다. 이름을 직접 말했으면 null"
+    ))
 
 
 class ParsedRequest(Slots, _RequestHead):
@@ -165,7 +180,7 @@ class BankState(TypedDict, total=False):
     parent_request_id: str | None # 복합 업무에서 앞 단계의 요청 ID
     log: list[str]                # 복합 업무의 단계별 결과
     log_shown: int                # log 중 사용자에게 이미 보여준 개수
-    last_targets: dict            # 최근 다룬 대상 (6단계에서 사용)
+    last_targets: dict            # 최근 다룬 대상 {"accounts": [...], "cards": [...], ..., "request": id}
 
 
 # 업무가 끝나면 비우는 필드
@@ -209,7 +224,7 @@ def _pick_slots(model: BaseModel, intent: str) -> dict:
         if isinstance(value, list):
             return [plain(v) for v in value]
         return value
-    return {name: plain(getattr(model, name)) for name in fn.TASKS[intent].slots}
+    return {name: plain(getattr(model, name, None)) for name in fn.TASKS[intent].slots}
 
 
 def _merge_slots(slots: dict, changes: dict) -> dict:
@@ -262,7 +277,58 @@ def parse_request(state: BankState) -> dict:
         }
 
     slots = _pick_slots(parsed, parsed.intent) if parsed.intent in fn.TASKS else {}
-    return {**update, "intent": parsed.intent, "slots": slots}
+    if parsed.intent == "query_request_status":
+        slots["context_request_id"] = (state.get("last_targets") or {}).get("request")
+    update = {**update, "intent": parsed.intent, "slots": slots}
+    return {**update, **_resolve_reference(state, parsed.intent, slots, parsed.referenced_slot)}
+
+
+# 지시어가 가리키는 슬롯 → (last_targets 종류, 확정 ID 슬롯, 대상 이름)
+REFERENCE_SLOTS = {
+    "card": ("cards", "card_id", "카드"),
+    "account": ("accounts", "account_id", "계좌"),
+    "from_account": ("accounts", "from_account_id", "출금 계좌"),
+    "to_account": ("accounts", "to_account_id", "입금 계좌"),
+    "bill": ("bills", "bill_id", "청구서"),
+    "application": ("applications", "application_id", "재발급 신청"),
+}
+
+
+def _resolve_reference(state: BankState, intent: str, slots: dict, referenced: str | None) -> dict:
+    """'그 카드'처럼 이전 대화를 가리키면 last_targets에서 대상을 찾는다.
+
+    - 최근 대상이 1개: 그 대상으로 확정 (처리안에 이름이 표시되어 승인 전에 확인됨)
+    - 여러 개: 그중에서 선택받는다
+    - 없음: 확신할 수 없으므로 전체 목록에서 확인받는다
+    """
+    if not referenced or referenced not in REFERENCE_SLOTS or intent not in fn.TASKS:
+        return {}
+    kind, id_slot, noun = REFERENCE_SLOTS[referenced]
+    task_slots = fn.TASKS[intent].slots
+    # 업무가 쓰지 않는 슬롯을 가리키면(예: 카드 업무에서 account) 업무의 대상 슬롯으로 맞춘다.
+    if referenced not in task_slots:
+        referenced = next((s for s in task_slots if s in REFERENCE_SLOTS and REFERENCE_SLOTS[s][0] == kind), None)
+        if referenced is None:
+            return {}
+        kind, id_slot, noun = REFERENCE_SLOTS[referenced]
+    if slots.get(referenced):
+        return {}
+
+    recent = (state.get("last_targets") or {}).get(kind) or []
+    if len(recent) == 1:
+        return {"slots": {**slots, id_slot: recent[0]}}
+
+    options = fn.target_options(state["user_id"], kind, recent)
+    lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
+    head = (
+        f"최근에 다룬 {noun} 후보가 여러 개예요." if recent
+        else f"말씀하신 대상({noun})을 대화에서 확실히 알 수 없어요."
+    )
+    return {
+        "step": "ask",
+        "question": f"{head} 어느 것인가요?\n" + "\n".join(lines),
+        "candidates": {"slot": id_slot, "options": options},
+    }
 
 
 def lookup(state: BankState) -> dict:
@@ -463,9 +529,17 @@ def respond(state: BankState) -> dict:
         parts.append(_labeled(state, state["error"]))
     if not parts:
         parts.append(_format_response(state))
+
+    # 이번 업무에서 다룬 대상을 기억한다. (다음 요청의 '그 카드', '아까 이체' 해석에 사용)
+    targets = dict(state.get("last_targets") or {})
+    targets.update(fn.targets_from(state.get("draft"), state.get("result")))
+    if state.get("request_id"):
+        targets["request"] = state["request_id"]
+
     return {
         "messages": [AIMessage("\n".join(parts))],
         **TASK_FIELDS, "log": [], "log_shown": 0, "multi_step": False,
+        "last_targets": targets,
     }
 
 
@@ -515,6 +589,15 @@ def _format_response(state: BankState) -> str:
             f"재발급 신청 {a['application_id']}\n- 카드: {a['card']}\n- 배송지: {a['address']}\n"
             f"- 상태: {a['status']}\n- 신청일: {a['created_at']}"
         )
+    if intent == "query_request_status":
+        r = result["request"]
+        text = (
+            f"{r['label']} 요청의 처리 상태는 '{r['status']}'예요. ({r['request_id']}, {r['created_at']} 요청)\n"
+            f"- 내용: {r['summary']}"
+        )
+        if r["message"]:
+            text += f"\n- 결과: {r['message']}"
+        return text
     if intent == "query_transactions":
         rows = result["transactions"]
         if not rows:
@@ -554,6 +637,8 @@ def route_after_parse(state: BankState) -> str:
     task = fn.TASKS.get(state["intent"])
     if task is None or state.get("error"):
         return "respond"
+    if state.get("step") == "ask":
+        return "ask_user"  # 지시어 대상 확인
     return "lookup" if task.kind == "query" else "resolve"
 
 
@@ -607,7 +692,7 @@ def build_graph(checkpointer=None):
         builder.add_node(name, node)
 
     builder.add_edge(START, "parse_request")
-    builder.add_conditional_edges("parse_request", route_after_parse, ["lookup", "resolve", "respond"])
+    builder.add_conditional_edges("parse_request", route_after_parse, ["lookup", "resolve", "ask_user", "respond"])
     builder.add_conditional_edges("lookup", route_after_lookup, ["ask_user", "respond"])
     builder.add_conditional_edges("resolve", route_after_resolve, ["create_request", "ask_user", "confirm", "next_task", "respond"])
     builder.add_conditional_edges("ask_user", route_after_ask, ["lookup", "resolve", "respond"])

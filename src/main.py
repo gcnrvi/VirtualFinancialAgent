@@ -105,6 +105,8 @@ class App:
         오류로 멈춘 경우만 처리한다.
         """
         state = self.graph.get_state(CONFIG)
+        if startup:
+            self._close_orphans(state)
         if not state.next:
             return
         if not startup and self._pending_interrupt():
@@ -142,6 +144,15 @@ class App:
         # 요청 기록 전 단계(조회·검증·안내)에서 멈춘 경우: 데이터 변경이 없으므로 그대로 이어서 실행한다.
         print("\n[이어서 진행] 처리 중이던 요청을 이어서 진행할게요.")
         self._run(None)
+
+
+    def _close_orphans(self, state) -> None:
+        """대화 상태와 연결되지 않은 승인 대기 요청을 알리고 정리한다."""
+        keep = state.values.get("request_id") if state.next else None
+        notes = fn.close_orphan_requests(USER_ID, keep)
+        if notes:
+            print("\n[이어서 진행] 처리가 끝나지 않은 요청이 있었어요. 자동으로 실행하지 않고 종료 처리했어요.")
+            print("\n".join(notes))
 
 
 def main() -> None:
