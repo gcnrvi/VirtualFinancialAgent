@@ -206,3 +206,40 @@ def test_followup_uses_last_request(chat):
     out = chat.say("그 전에 한 이체는?", P(intent="query_request_status", reason="", request_kind="transfer", earlier_request=True))
     assert "'완료'" in out and "10,000원" in out
     assert chat.state()["last_targets"]["request"] == "req-001"
+
+
+# ---- 질문·승인 대기 중 새 요청 -------------------------------------------------------
+
+def test_new_request_while_question_pending(chat):
+    chat.say("이체", transfer(10_000))
+    chat.say("승인", APPROVE)
+    chat.say("이체", transfer(20_000, src="저축", dst="여행 자금"))
+    chat.say("안 할래", REJECT)
+    chat.say("카드 잠가줘", P(intent="lock_card", reason="", card="생활비 카드"))   # 마지막 요청이 이체가 아니게
+    chat.say("거절", REJECT)
+    out = chat.say("아까 이체 됐어?", P(intent="query_request_status", reason="", request_kind="transfer"))
+    assert chat.waiting == "question"                                    # 이체 2건 → 선택 질문
+
+    out = chat.say("생활비에서 저축으로 2만원 보내줘",
+                   S(cancel=False, new_request=True), transfer(20_000))
+    assert "질문은 그만두고, 새 요청을 처리할게요" in out
+    assert chat.waiting == "approval" and "금액: 20,000원" in out          # 새 요청으로 진행
+
+
+def test_new_request_while_approval_pending_cancels_request(chat):
+    chat.say("이체", transfer(10_000))
+    out = chat.say("아 그 전에 카드 목록 보여줘", A(decision="new_request"), P(intent="query_cards", reason=""))
+    assert "즉시이체 요청은 취소하고" in out and "카드 목록이에요" in out
+    assert chat.waiting is None
+    assert load()["requests"][0]["status"] == "cancelled"
+    assert balance("acc-001") == 1_431_800
+    assert chat.state()["last_targets"]["request"] == "req-001"          # 취소한 요청도 마지막 요청으로 기억
+
+
+def test_new_request_during_composite_stops_remaining_step(chat):
+    chat.say("정지하고 재발급", lost_and_reissue())
+    chat.say("승인", APPROVE)                                             # 정지 완료 → 배송지 질문
+    out = chat.say("잔액 보여줘", S(cancel=False, new_request=True), P(intent="query_accounts", reason=""))
+    assert "이어서 하려던 단계도 진행하지 않아요" not in out              # 재발급은 질문 단계(요청 전)
+    assert "질문은 그만두고" in out and "총 잔액" in out
+    assert card_status("card-001") == "lost" and load()["reissue_applications"] == []

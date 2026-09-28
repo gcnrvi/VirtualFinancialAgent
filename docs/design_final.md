@@ -50,6 +50,7 @@ flowchart TD
     ask -->|변경 업무| resolve
     ask -->|조회 업무| lookup
     ask -->|사용자가 중단| respond
+    ask -->|다른 업무를 새로 요청| parse
 
     record -->|기록 성공| confirm[confirm<br/>interrupt: 처리안 제시<br/>LLM: 승인 응답 분류]
     record -->|저장 실패| respond
@@ -58,6 +59,7 @@ flowchart TD
     confirm -->|reject: 요청 cancelled| next
     confirm -->|modify: 슬롯 병합| resolve
     confirm -->|unclear| confirm
+    confirm -->|new_request: 요청 cancelled| parse
 
     execute -->|changed: 조건부 이체 금액 변동| confirm
     execute -->|완료 / 실패| next{next_task<br/>task_queue 확인}
@@ -94,6 +96,7 @@ flowchart TD
 | **승인** | `ApprovalReply.decision == "approve"` | `confirm → execute → next_task → respond` | 업무 데이터 + 요청 `completed`/`partial` |
 | **거절** | `decision == "reject"` 또는 추가 질문 중 `SlotAnswer.cancel` | `confirm → next_task`(남은 단계 중단) / `ask_user → respond` | 요청 `cancelled` |
 | **수정** | `decision == "modify"`이고 바뀐 값이 있음 | `confirm → resolve → create_request → confirm` | 같은 요청의 `params` 갱신 |
+| **전환** | 대기 중에 다른 업무를 새로 요청(`SlotAnswer.new_request`, `decision == "new_request"`) | `ask_user`·`confirm → parse_request` (입력한 문장을 새 요청으로 해석) | 진행 중이던 요청 `cancelled`, 남은 단계 중단 |
 | **실패** | 검증 실패, 실행 직전 재검증 실패, 저장 실패, LLM 실패 | 아래 3-2 | 검증·재검증 실패는 요청 `failed`. 저장 실패는 파일 유지 |
 
 ### 3-2. 분기 함수
@@ -108,9 +111,10 @@ flowchart TD
 | `route_after_resolve` | `ok` / `ask` / `revert` / `skip` | `create_request` / `ask_user` / `confirm` / `next_task` |
 | | `fail` | `respond` |
 | `route_after_ask` | `step == "cancel"` | `respond` |
+| | `step == "switch"` (새 요청) | `parse_request` |
 | | 조회 업무 / 변경 업무 | `lookup` / `resolve` |
 | `route_after_create` | `ok` / 저장 실패 | `confirm` / `respond` |
-| `route_after_confirm` | `approve` / `reject` / `modify` / `unclear` | `execute` / `next_task` / `resolve` / `confirm` |
+| `route_after_confirm` | `approve` / `reject` / `modify` / `new_request` / `unclear` | `execute` / `next_task` / `resolve` / `parse_request` / `confirm` |
 | `route_after_execute` | `step == "changed"` | `confirm` |
 | | 그 외 | `next_task` |
 | `route_after_next` | `task_queue`에서 다음 단계를 꺼냄(`next`) / 비어 있음 | `resolve` / `respond` |
@@ -139,7 +143,7 @@ flowchart TD
 | `slots` | `parse_request`(LLM 추출·지시어 대상 ID), `ask_user`(답변 병합·후보 선택 ID), `confirm`(수정 병합), `resolve`(수정 실패 시 복구), `next_task`(앞 단계 대상 ID 전달) | 업무 종료(`respond`) |
 | `slots_backup` | `confirm`(수정 직전 값) | `create_request`, `resolve`(복구 시), 업무 종료 |
 | `draft` | `resolve`(검증 통과), `execute`(조건부 이체 금액 변동) | 업무 종료 |
-| `step` | `parse_request`(`ask`), `lookup`, `resolve`, `ask_user`(`cancel`), `create_request`, `execute`(`changed`/`done`), `next_task`(`next`/`done`) | 업무 종료 |
+| `step` | `parse_request`(`ask`), `lookup`, `resolve`, `ask_user`(`cancel`/`switch`), `confirm`(`switch`), `create_request`, `execute`(`changed`/`done`), `next_task`(`next`/`done`) | 업무 종료 |
 | `question`, `candidates` | `parse_request`(지시어), `lookup`, `resolve`의 `ask` | 업무 종료 |
 | `plan` | `create_request`, `execute`(금액 변동) | 업무 종료 |
 | `notice` | `resolve`(수정 실패), `confirm`(판단 불가), `execute`(금액 변동), 재시작 복구(`main.py`) | `confirm` 진입 후 |
@@ -150,8 +154,8 @@ flowchart TD
 | `task_queue` | `parse_request`(복합 업무 분해) | `next_task`에서 하나씩 꺼냄, 앞 단계 거절·실패 시 비움 |
 | `multi_step` | `parse_request`(복합 업무) | 업무 종료 |
 | `parent_request_id` | `next_task`(앞 단계 요청 ID) | 업무 종료 |
-| `log`, `log_shown` | `execute`·`confirm`(거절)·`resolve`(건너뜀)가 단계 결과 추가 / `ask_user`·`confirm`이 보여준 뒤 개수 갱신 | 새 요청, 업무 종료 |
-| `last_targets` | `respond`(이번 업무에서 다룬 계좌·카드·청구서·재발급 신청 ID, 마지막 요청 ID) | 유지(세션 전체) |
+| `log`, `log_shown` | `execute`·`confirm`(거절)·`resolve`(건너뜀)가 단계 결과 추가, 전환 시 취소 안내 / `ask_user`·`confirm`이 보여준 뒤 개수 갱신 | 새 요청(전환이면 취소 안내를 이어받음), 업무 종료 |
+| `last_targets` | `respond`(이번 업무에서 다룬 계좌·카드·청구서·재발급 신청 ID, 마지막 요청 ID), 전환 시 취소한 요청 ID | 유지(세션 전체) |
 
 ### 예: 즉시이체를 승인 전에 수정
 
@@ -176,8 +180,8 @@ class ParsedRequest(Slots, _RequestHead):    # 필드 순서: intent, reason, re
     reason: str
     referenced_slot: Literal["card", "account", "from_account", "to_account", "bill", "application"] | None
 
-class SlotAnswer(Slots, _AnswerHead):        # cancel, selected_id, 슬롯...
-class ApprovalReply(Slots, _ApprovalHead):   # decision, 슬롯(modify일 때 바뀐 값만)...
+class SlotAnswer(Slots, _AnswerHead):        # cancel, new_request, selected_id, 슬롯...
+class ApprovalReply(Slots, _ApprovalHead):   # decision(approve·reject·modify·new_request·unclear), 슬롯...
 ```
 
 `Slots` (모든 스키마 공통)
@@ -299,7 +303,7 @@ class ApprovalReply(Slots, _ApprovalHead):   # decision, 슬롯(modify일 때 �
 
 ## 9. 검증
 
-`uv run pytest` 125개(가짜 LLM으로 그래프 흐름·재시작 복구 포함), `RUN_LLM_TESTS=1 uv run pytest -m llm` 13개. 실행 결과와 직접 고른 실패 상황은 [README 5절](../README.md#5-동작-확인-결과)에 정리했다.
+`uv run pytest` 128개(가짜 LLM으로 그래프 흐름·재시작 복구 포함), `RUN_LLM_TESTS=1 uv run pytest -m llm` 16개. 실행 결과와 직접 고른 실패 상황은 [README 5절](../README.md#5-동작-확인-결과)에 정리했다.
 
 ---
 
@@ -346,6 +350,7 @@ class ApprovalReply(Slots, _ApprovalHead):   # decision, 슬롯(modify일 때 �
 | 일괄 납부 중단 시 "남은 건은 **새 요청**으로 재승인" | **같은 요청**의 `params`를 남은 건으로 갱신해 재승인하고, 결과에 이전 완료 건을 합산 | 건별 저장에 진행 기록을 함께 남기고, 재검증에서 이미 낸 건이 자연스럽게 빠진다. 결과를 한 요청에서 볼 수 있다. |
 | 재시작 복구는 체크포인트 상태만 확인 | 대화와 연결되지 않은 대기 요청을 찾아 정리(`close_orphan_requests`) | 일괄 납부의 최종 기록 저장이 실패하면 그래프는 끝났는데 요청만 대기로 남는다. |
 | 결과 안내는 LLM이 생성 | 템플릿 문장 | 금액·잔액을 잘못 말할 위험을 없애고 테스트를 쉽게 한다. |
+| 질문·승인 대기 중 입력은 모두 그 질문의 답으로 해석 | 다른 업무 요청이면 진행 중이던 요청을 취소하고 새 요청으로 해석(`new_request`, `ask_user`·`confirm → parse_request`) | 최종 점검에서 발견. 후보 선택 질문 중 새 요청을 입력하면 같은 질문만 반복됐고, 대기 상태가 체크포인트에 남아 재시작해도 빠져나올 수 없었다. |
 | 실행 함수를 Tool로 제공(원래 파일 주석) | 그래프 노드가 `TASKS`를 직접 호출 | 검증 → 승인 → 실행 순서를 그래프가 보장한다. LLM이 실행 시점을 정하지 않는다. |
 | 테스트 시드: `card-002` 제작 중 | `card-002` 제작 중 + `card-005`(교통 카드) 배송 중·취소 이력 | 배송 중 제한과, 취소된 신청이 후보에서 빠지는 것까지 확인한다. |
 
@@ -369,3 +374,4 @@ class ApprovalReply(Slots, _ApprovalHead):   # decision, 슬롯(modify일 때 �
 | v0.8 | 5단계 | 판단 필드 앞 배치(5/30 → 0/30), 기간 7종, 출금·결제 구분, `changed` 재승인, `_apply_transfer` 공유, 여러 계좌 이체 매칭 규칙, 별명 중복 규칙 | 10-3, 10-4 참고 |
 | v0.9 | 6단계 | `referenced_slot`, 종류별 `last_targets`, 지시어 확인 규칙, 후속 조회 우선순위·`earlier_request`, 연결 없는 대기 요청 정리 | 10-2, 10-3, 10-4 참고 |
 | 최종 | 정리 | 테스트를 `tests/`(pytest)로 이동, 가짜 LLM·임시 폴더 격리, 체크포인트 경로를 실행 시점에 읽도록 변경 | 실제 데이터를 건드리지 않고 흐름·복구를 반복 확인 |
+| 최종 | 점검 | 대기 중 새 요청 전환(`new_request`), 조회 결과는 앞선 안내가 있어도 항상 표시 | 전체 시나리오 점검에서 발견한 결함 수정 |

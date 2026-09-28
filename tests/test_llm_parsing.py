@@ -36,3 +36,25 @@ def test_reference_is_marked_without_guessing_name():
     parsed = g.get_llm().with_structured_output(g.ParsedRequest).invoke(f"{g._user_context('user-001')}\n\n사용자 요청: 그 카드 잠가줘")
     assert parsed.intent == "lock_card"
     assert parsed.referenced_slot == "card" and parsed.card is None
+
+
+def ask(question, answer, candidates=""):
+    prompt = (
+        "은행 앱이 사용자에게 추가 정보를 물었고, 사용자가 답했습니다. 답변에서 값을 추출하세요.\n"
+        "답변이 질문과 관계없는 다른 업무 요청이면 new_request를 true로 하세요.\n"
+        f"질문: {question}\n{candidates}사용자 답변: {answer}"
+    )
+    return g.get_llm().with_structured_output(g.SlotAnswer).invoke(prompt)
+
+
+def test_answer_vs_new_request_in_question():
+    assert ask("다음 정보를 알려주세요: 출금 계좌", "생활비에서").new_request is False
+    reply = ask("어떤 이체 요청을 말씀하시는 건가요?\n1) 즉시이체 · 완료 (req-012)\n2) 즉시이체 · 취소 (req-002)",
+                "생활비에서 저축으로 2만원 보내줘")
+    assert reply.new_request is True
+
+
+@pytest.mark.parametrize("answer, decision", [("응, 진행해", "approve"), ("잠깐, 그 전에 카드 목록 보여줘", "new_request")])
+def test_approval_vs_new_request(answer, decision):
+    prompt = f"은행 앱이 아래 처리안의 승인 여부를 물었고, 사용자가 답했습니다. 답변을 분류하세요.\n\n처리안:\n[즉시이체] 생활비 → 저축 10,000원\n\n사용자 답변: {answer}"
+    assert g.get_llm().with_structured_output(g.ApprovalReply).invoke(prompt).decision == decision
