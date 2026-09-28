@@ -12,7 +12,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -369,27 +369,13 @@ def execute_transfer(user_id: str, request_id: str) -> dict:
     source = _find_account(data, user_id, draft["from_account_id"])
     target = _find_account(data, user_id, draft["to_account_id"])
     amount = draft["amount"]
-    now = now_kst()
-
-    source["balance"] -= amount
-    target["balance"] += amount
-
-    withdrawal_id = _next_id(data["transactions"], "transaction_id", "tx")
-    data["transactions"].append(
-        _transfer_transaction(withdrawal_id, user_id, source, "withdrawal", amount, now, target)
-    )
-    deposit_id = _next_id(data["transactions"], "transaction_id", "tx")
-    data["transactions"].append(
-        _transfer_transaction(deposit_id, user_id, target, "deposit", amount, now, source)
-    )
+    transaction_ids = _apply_transfer(data, user_id, source, target, amount, now_kst())
 
     message = (
         f"{source['nickname']}에서 {with_ro(target['nickname'])} {won(amount)}을 이체했어요. "
         f"{source['nickname']} 잔액은 {won(source['balance'])}이에요."
     )
-    _set_request_result(
-        request, "completed", message, transaction_ids=[withdrawal_id, deposit_id]
-    )
+    _set_request_result(request, "completed", message, transaction_ids=transaction_ids)
 
     try:
         save_data(data)
@@ -399,6 +385,23 @@ def execute_transfer(user_id: str, request_id: str) -> dict:
             "message": f"이체 내용을 저장하지 못해 이체가 반영되지 않았어요. ({e})",
         }
     return {"status": "completed", "message": message}
+
+
+def _apply_transfer(
+    data: dict, user_id: str, source: dict, target: dict, amount: int, now: str
+) -> list[str]:
+    """메모리의 data에 이체 한 건(잔액 2건, 거래 2건)을 반영하고 거래 ID를 돌려준다. 저장은 호출한 쪽에서."""
+    source["balance"] -= amount
+    target["balance"] += amount
+    withdrawal_id = _next_id(data["transactions"], "transaction_id", "tx")
+    data["transactions"].append(
+        _transfer_transaction(withdrawal_id, user_id, source, "withdrawal", amount, now, target)
+    )
+    deposit_id = _next_id(data["transactions"], "transaction_id", "tx")
+    data["transactions"].append(
+        _transfer_transaction(deposit_id, user_id, target, "deposit", amount, now, source)
+    )
+    return [withdrawal_id, deposit_id]
 
 
 def _transfer_transaction(
@@ -1305,6 +1308,434 @@ def _batch_message(items: list[dict], account: dict, stopped: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 거래 내역 조회 (설계 6-2)
+# ---------------------------------------------------------------------------
+
+PERIOD_LABELS = {
+    "today": "오늘", "this_week": "이번 주", "last_week": "지난주",
+    "this_month": "이번 달", "last_month": "지난달", "custom": "지정 기간", "all": "전체 기간",
+}
+TX_TYPE_LABELS = {"deposit": "입금", "withdrawal": "출금", "card_payment": "카드 결제"}
+
+
+def period_range(period: str | None, today: date, start: str | None = None, end: str | None = None) -> tuple[date | None, date | None]:
+    """기간 이름을 (시작일, 종료일)로 바꾼다. 둘 다 포함하며 None이면 제한 없음.
+
+    이번 주는 월요일~일요일, 이번 달은 기준일이 속한 달이다.
+    """
+    if period == "today":
+        return today, today
+    if period in ("this_week", "last_week"):
+        monday = today - timedelta(days=today.weekday())
+        if period == "last_week":
+            monday -= timedelta(days=7)
+        return monday, monday + timedelta(days=6)
+    if period in ("this_month", "last_month"):
+        first = today.replace(day=1)
+        if period == "last_month":
+            first = (first - timedelta(days=1)).replace(day=1)
+        next_first = (first + timedelta(days=32)).replace(day=1)
+        return first, next_first - timedelta(days=1)
+    if period == "custom":
+        return (date.fromisoformat(start) if start else None, date.fromisoformat(end) if end else None)
+    return None, None
+
+
+def query_transactions(user_id: str, slots: dict | None = None) -> dict:
+    """기간·금액·유형·계좌로 거래를 걸러 최근순으로 돌려준다. 카드 결제에는 카드 이름을 붙인다."""
+    slots = slots or {}
+    data = load_data()
+
+    # 계좌 (선택)
+    account = None
+    if slots.get("account") or slots.get("account_id"):
+        result = _resolve_account_slot(data, user_id, slots, "account", "조회할 계좌")
+        if result["status"] != "ok":
+            return result
+        account = result["account"]
+
+    # 기간
+    period = slots.get("period") or "all"
+    try:
+        start, end = period_range(period, date.fromisoformat(today_kst()), slots.get("start_date"), slots.get("end_date"))
+    except ValueError:
+        return {"status": "fail", "error": "날짜는 YYYY-MM-DD 형식이어야 해요."}
+    if start and end and start > end:
+        return {"status": "fail", "error": f"시작일({start})이 종료일({end})보다 늦어요."}
+
+    # 금액
+    min_amount, max_amount = slots.get("min_amount"), slots.get("max_amount")
+    for value in (min_amount, max_amount):
+        if value is not None and value < 0:
+            return {"status": "fail", "error": "금액 조건은 0원 이상이어야 해요."}
+    if min_amount is not None and max_amount is not None and min_amount > max_amount:
+        return {"status": "fail", "error": "최소 금액이 최대 금액보다 커요."}
+
+    tx_type = slots.get("tx_type")
+    cards = {c["card_id"]: c["name"] for c in data["cards"]}
+    accounts = {a["account_id"]: a["nickname"] for a in data["accounts"]}
+
+    rows = []
+    for t in data["transactions"]:
+        if t["owner_id"] != user_id:
+            continue
+        if account and t["account_id"] != account["account_id"]:
+            continue
+        day = date.fromisoformat(t["occurred_at"][:10])
+        if (start and day < start) or (end and day > end):
+            continue
+        if (min_amount is not None and t["amount"] < min_amount) or (max_amount is not None and t["amount"] > max_amount):
+            continue
+        is_card_payment = t["type"] == "withdrawal" and t["card_id"] is not None
+        if tx_type == "card_payment" and not is_card_payment:
+            continue
+        if tx_type in ("deposit", "withdrawal") and t["type"] != tx_type:
+            continue
+        rows.append({
+            "transaction_id": t["transaction_id"],
+            "occurred_at": t["occurred_at"][:16].replace("T", " "),
+            "account": accounts.get(t["account_id"], t["account_id"]),
+            "type": "카드 결제" if is_card_payment else TX_TYPE_LABELS[t["type"]],
+            "amount": t["amount"],
+            "merchant": t["merchant"],
+            "card": cards.get(t["card_id"]) if t["card_id"] else None,
+            "sign": 1 if t["type"] == "deposit" else -1,
+        })
+    rows.sort(key=lambda r: (r["occurred_at"], r["transaction_id"]), reverse=True)
+
+    filters = [PERIOD_LABELS.get(period, period)]
+    if start or end:
+        filters[0] += f" ({start or '처음'} ~ {end or '현재'})"
+    if account:
+        filters.append(f"{account['nickname']} 계좌")
+    if tx_type:
+        filters.append(TX_TYPE_LABELS[tx_type])
+    if min_amount is not None:
+        filters.append(f"{won(min_amount)} 이상")
+    if max_amount is not None:
+        filters.append(f"{won(max_amount)} 이하")
+
+    return {
+        "status": "ok",
+        "filters": ", ".join(filters),
+        "transactions": rows,
+        "deposit_total": sum(r["amount"] for r in rows if r["sign"] > 0),
+        "withdrawal_total": sum(r["amount"] for r in rows if r["sign"] < 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 조건부 이체 (설계 6-2)
+# ---------------------------------------------------------------------------
+
+CONDITIONAL_SLOTS = {"from_account": "출금 계좌", "to_account": "입금 계좌", "keep_amount": "출금 계좌에 남길 금액"}
+
+
+def _resolve_two_accounts(data: dict, user_id: str, slots: dict, labels: dict) -> dict:
+    """누락 확인 후 출금·입금 계좌를 확정한다. 즉시이체·조건부 이체 공통."""
+    missing = [s for s in labels if slots.get(s) is None and slots.get(f"{s}_id") is None]
+    if missing:
+        return {
+            "status": "ask",
+            "question": "다음 정보를 알려주세요: " + ", ".join(labels[s] for s in missing),
+            "missing": missing,
+            "candidates": None,
+        }
+    resolved = {}
+    for role in ("from_account", "to_account"):
+        result = _resolve_account_slot(data, user_id, slots, role, labels[role])
+        if result["status"] != "ok":
+            return result
+        resolved[role] = result["account"]
+    return {"status": "ok", **resolved}
+
+
+def _conditional_amount(source: dict, keep_amount: int) -> int:
+    return source["balance"] - keep_amount
+
+
+def _validate_conditional(data: dict, user_id: str, draft: dict) -> str | None:
+    keep = draft["keep_amount"]
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
+        return "남길 금액은 0원 이상의 정수여야 해요."
+    source = _find_account(data, user_id, draft["from_account_id"])
+    target = _find_account(data, user_id, draft["to_account_id"])
+    if source is None or target is None:
+        return "이체할 계좌를 찾을 수 없어요."
+    if source["account_id"] == target["account_id"]:
+        return "같은 계좌로는 이체할 수 없어요."
+    amount = _conditional_amount(source, keep)
+    if amount <= 0:
+        return (
+            f"{source['nickname']} 잔액({won(source['balance'])})이 남길 금액({won(keep)}) 이하라 "
+            "이체할 금액이 없어요."
+        )
+    return None
+
+
+def resolve_conditional_transfer(user_id: str, slots: dict) -> dict:
+    """누락 → 계좌 매칭 → 남길 금액 ≥ 0 → 같은 계좌 → 이체액 > 0 순서로 검증한다."""
+    data = load_data()
+    result = _resolve_two_accounts(data, user_id, slots, CONDITIONAL_SLOTS)
+    if result["status"] != "ok":
+        return result
+    draft = {
+        "from_account_id": result["from_account"]["account_id"],
+        "to_account_id": result["to_account"]["account_id"],
+        "keep_amount": slots["keep_amount"],
+    }
+    error = _validate_conditional(data, user_id, draft)
+    if error:
+        return {"status": "fail", "error": error}
+    draft["amount"] = _conditional_amount(result["from_account"], draft["keep_amount"])
+    return {"status": "ok", "draft": draft}
+
+
+def describe_conditional_transfer(user_id: str, draft: dict) -> str:
+    data = load_data()
+    source = _find_account(data, user_id, draft["from_account_id"])
+    target = _find_account(data, user_id, draft["to_account_id"])
+    return (
+        "[조건부 이체]\n"
+        f"- 출금: {source['nickname']} ({source['account_id']}, 현재 잔액 {won(source['balance'])})\n"
+        f"- 입금: {target['nickname']} ({target['account_id']})\n"
+        f"- 남길 금액: {won(draft['keep_amount'])}\n"
+        f"- 이체할 금액: {won(draft['amount'])} (현재 잔액 − 남길 금액)\n"
+        "- 안내: 실행 직전 잔액이 바뀌어 이체할 금액이 달라지면 다시 확인받아요."
+    )
+
+
+def execute_conditional_transfer(user_id: str, request_id: str) -> dict:
+    """실행 직전 이체액을 다시 계산한다. 승인한 금액과 다르면 실행하지 않고 재승인을 요청한다."""
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    error = _validate_conditional(data, user_id, draft)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    source = _find_account(data, user_id, draft["from_account_id"])
+    target = _find_account(data, user_id, draft["to_account_id"])
+    amount = _conditional_amount(source, draft["keep_amount"])
+    if amount != draft["amount"]:
+        return {
+            "status": "changed",
+            "draft": {**draft, "amount": amount},
+            "message": (
+                f"승인 후 {source['nickname']} 잔액이 바뀌어 이체할 금액이 "
+                f"{won(draft['amount'])}에서 {won(amount)}으로 달라졌어요. 다시 확인해 주세요."
+            ),
+        }
+
+    transaction_ids = _apply_transfer(data, user_id, source, target, amount, now_kst())
+    message = (
+        f"{source['nickname']}에 {won(draft['keep_amount'])}을 남기고 "
+        f"{with_ro(target['nickname'])} {won(amount)}을 이체했어요."
+    )
+    _set_request_result(request, "completed", message, transaction_ids=transaction_ids)
+    return _save_result(data, message)
+
+
+# ---------------------------------------------------------------------------
+# 여러 계좌로 나눠 이체 (설계 6-2)
+# ---------------------------------------------------------------------------
+
+def _validate_multi_transfer(data: dict, user_id: str, draft: dict) -> str | None:
+    source = _find_account(data, user_id, draft["from_account_id"])
+    if source is None:
+        return "출금 계좌를 찾을 수 없어요."
+    seen = set()
+    for item in draft["items"]:
+        target = _find_account(data, user_id, item["to_account_id"])
+        if target is None:
+            return "입금 계좌를 찾을 수 없어요."
+        amount = item["amount"]
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            return f"{with_ro(target['nickname'])} 보낼 금액은 1원 이상의 정수여야 해요."
+        if target["account_id"] == source["account_id"]:
+            return "출금 계좌로는 이체할 수 없어요."
+        if target["account_id"] in seen:
+            return f"{target['nickname']} 계좌가 두 번 들어 있어요. 입금 계좌는 한 번씩만 지정해 주세요."
+        seen.add(target["account_id"])
+    total = sum(i["amount"] for i in draft["items"])
+    if source["balance"] < total:
+        return f"{source['nickname']} 잔액({won(source['balance'])})이 이체 총액({won(total)})보다 적어요."
+    return None
+
+
+def resolve_multi_transfer(user_id: str, slots: dict) -> dict:
+    """출금 계좌 → 입금 목록 → 각 입금 계좌 매칭 → 금액·중복·잔액 순서로 검증한다."""
+    data = load_data()
+    if not slots.get("from_account") and not slots.get("from_account_id"):
+        return {"status": "ask", "question": "어느 계좌에서 보낼까요?", "missing": ["from_account"], "candidates": None}
+    result = _resolve_account_slot(data, user_id, slots, "from_account", "출금 계좌")
+    if result["status"] != "ok":
+        return result
+    source = result["account"]
+
+    transfers = slots.get("transfers") or []
+    if not transfers:
+        return {
+            "status": "ask",
+            "question": "어느 계좌로 얼마씩 보낼까요? (예: 저축 20만 원, 여행 자금 10만 원)",
+            "missing": ["transfers"],
+            "candidates": None,
+        }
+
+    items = []
+    for t in transfers:
+        name, amount = t.get("to_account"), t.get("amount")
+        if not name or amount is None:
+            return {"status": "ask", "question": "입금 계좌와 금액을 모두 알려주세요.", "missing": ["transfers"], "candidates": None}
+        matches, _ = match_accounts(data, user_id, name)
+        if not matches:
+            return {"status": "fail", "error": f"'{name}' 계좌를 찾을 수 없어요."}
+        if len(matches) > 1:
+            labels = ", ".join(a["nickname"] for a in matches)
+            return {"status": "fail", "error": f"'{name}'에 해당하는 계좌가 여러 개예요. ({labels}) 이름을 정확히 알려주세요."}
+        items.append({"to_account_id": matches[0]["account_id"], "amount": amount})
+
+    draft = {"from_account_id": source["account_id"], "items": items}
+    error = _validate_multi_transfer(data, user_id, draft)
+    if error:
+        return {"status": "fail", "error": error}
+    return {"status": "ok", "draft": draft}
+
+
+def describe_multi_transfer(user_id: str, draft: dict) -> str:
+    data = load_data()
+    source = _find_account(data, user_id, draft["from_account_id"])
+    total = sum(i["amount"] for i in draft["items"])
+    lines = [
+        f"  {n}. {_find_account(data, user_id, i['to_account_id'])['nickname']}: {won(i['amount'])}"
+        for n, i in enumerate(draft["items"], 1)
+    ]
+    return (
+        "[여러 계좌로 나눠 이체]\n"
+        f"- 출금: {source['nickname']} ({source['account_id']})\n"
+        "- 입금:\n" + "\n".join(lines) + "\n"
+        f"- 총액: {won(total)}\n"
+        f"- 이체 후 {source['nickname']} 잔액: {won(source['balance'] - total)}\n"
+        "- 안내: 모든 이체를 한 번에 처리해요. 하나라도 실패하면 전체를 반영하지 않아요."
+    )
+
+
+def execute_multi_transfer(user_id: str, request_id: str) -> dict:
+    """모든 이체의 잔액·거래·요청 상태를 한 번에 저장한다. 일부만 반영하지 않는다."""
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    error = _validate_multi_transfer(data, user_id, draft)
+    if error:
+        return _fail_and_save(data, request, error)
+
+    source = _find_account(data, user_id, draft["from_account_id"])
+    now = now_kst()
+    transaction_ids, parts = [], []
+    for item in draft["items"]:
+        target = _find_account(data, user_id, item["to_account_id"])
+        transaction_ids += _apply_transfer(data, user_id, source, target, item["amount"], now)
+        parts.append(f"{target['nickname']} {won(item['amount'])}")
+    total = sum(i["amount"] for i in draft["items"])
+    message = (
+        f"{source['nickname']}에서 {', '.join(parts)}을 이체했어요. (총 {won(total)}) "
+        f"{source['nickname']} 잔액은 {won(source['balance'])}이에요."
+    )
+    _set_request_result(request, "completed", message, transaction_ids=transaction_ids)
+    try:
+        save_data(data)
+    except SaveError as e:
+        return {"status": "failed", "message": f"이체 내용을 저장하지 못해 모든 이체가 반영되지 않았어요. ({e})"}
+    return {"status": "completed", "message": message}
+
+
+# ---------------------------------------------------------------------------
+# 계좌 별명 변경 (설계 6-2)
+# ---------------------------------------------------------------------------
+
+NICKNAME_MAX = 20
+
+
+def _validate_nickname(data: dict, user_id: str, account: dict, nickname: str) -> str | None:
+    if not 1 <= len(nickname) <= NICKNAME_MAX:
+        return f"별명은 앞뒤 공백을 빼고 1~{NICKNAME_MAX}자여야 해요. (입력: {len(nickname)}자)"
+    if nickname == account["nickname"]:
+        return f"이미 별명이 '{nickname}'이에요."
+    key = _normalize_name(nickname)
+    for other in _user_accounts(data, user_id):
+        if other["account_id"] != account["account_id"] and _normalize_name(other["nickname"]) == key:
+            return f"'{other['nickname']}' 계좌와 별명이 겹쳐요. 다른 이름을 정해 주세요."
+    return None
+
+
+def resolve_rename_account(user_id: str, slots: dict) -> dict:
+    """대상 계좌 → 새 별명 누락 → 길이 → 현재와 같음 → 다른 계좌와 중복 순서로 검증한다."""
+    data = load_data()
+    if not slots.get("account") and not slots.get("account_id"):
+        options = [{"id": a["account_id"], "label": a["nickname"]} for a in _user_accounts(data, user_id)]
+        lines = [f"{i}) {o['label']} ({o['id']})" for i, o in enumerate(options, 1)]
+        return {
+            "status": "ask",
+            "question": "어느 계좌의 별명을 바꿀까요?\n" + "\n".join(lines),
+            "missing": ["account"],
+            "candidates": {"slot": "account_id", "options": options},
+        }
+    result = _resolve_account_slot(data, user_id, slots, "account", "대상 계좌")
+    if result["status"] != "ok":
+        return result
+    account = result["account"]
+
+    nickname = slots.get("new_nickname")
+    if nickname is None:
+        return {
+            "status": "ask",
+            "question": f"'{account['nickname']}' 계좌의 새 별명을 알려주세요. (1~{NICKNAME_MAX}자)",
+            "missing": ["new_nickname"],
+            "candidates": None,
+        }
+    nickname = nickname.strip()
+    error = _validate_nickname(data, user_id, account, nickname)
+    if error:
+        return {"status": "fail", "error": error}
+    return {"status": "ok", "draft": {"account_id": account["account_id"], "new_nickname": nickname}}
+
+
+def describe_rename_account(user_id: str, draft: dict) -> str:
+    account = _find_account(load_data(), user_id, draft["account_id"])
+    return (
+        "[계좌 별명 변경]\n"
+        f"- 계좌: {account['account_id']}\n"
+        f"- 별명: {account['nickname']} → {draft['new_nickname']}\n"
+        "- 안내: 이미 기록된 이체 거래의 상대 계좌 이름은 바뀌지 않아요."
+    )
+
+
+def execute_rename_account(user_id: str, request_id: str) -> dict:
+    data = load_data()
+    request = _find_request(data, request_id)
+    if request["status"] != "pending_approval":
+        return {"status": "skipped", "message": f"이미 처리된 요청이에요. (상태: {request['status']})"}
+
+    draft = request["params"]
+    account = _find_account(data, user_id, draft["account_id"])
+    error = "계좌를 찾을 수 없어요." if account is None else _validate_nickname(data, user_id, account, draft["new_nickname"])
+    if error:
+        return _fail_and_save(data, request, error)
+
+    before = account["nickname"]
+    account["nickname"] = draft["new_nickname"]
+    message = f"'{before}' 계좌의 별명을 {with_ro(draft['new_nickname'])} 바꿨어요."
+    _set_request_result(request, "completed", message, before=before)
+    return _save_result(data, message)
+
+
+# ---------------------------------------------------------------------------
 # 업무 레지스트리
 # ---------------------------------------------------------------------------
 
@@ -1357,6 +1788,24 @@ TASKS: dict[str, Task] = {
         resolve=resolve_cancel_reissue, describe=describe_cancel_reissue, execute=execute_cancel_reissue,
     ),
     "query_bills": Task(kind="query", label="미납 청구서 조회", query=query_bills),
+    "query_transactions": Task(
+        kind="query", label="거래 내역 조회",
+        slots=("account", "period", "start_date", "end_date", "min_amount", "max_amount", "tx_type"),
+        query=query_transactions,
+    ),
+    "conditional_transfer": Task(
+        kind="change", label="조건부 이체", slots=("from_account", "to_account", "keep_amount"),
+        resolve=resolve_conditional_transfer, describe=describe_conditional_transfer,
+        execute=execute_conditional_transfer,
+    ),
+    "multi_transfer": Task(
+        kind="change", label="여러 계좌 이체", slots=("from_account", "transfers"),
+        resolve=resolve_multi_transfer, describe=describe_multi_transfer, execute=execute_multi_transfer,
+    ),
+    "rename_account": Task(
+        kind="change", label="계좌 별명 변경", slots=("account", "new_nickname"),
+        resolve=resolve_rename_account, describe=describe_rename_account, execute=execute_rename_account,
+    ),
     "pay_bill": Task(
         kind="change", label="청구서 납부", slots=("from_account", "bill"),
         resolve=resolve_pay_bill, describe=describe_pay_bill, execute=execute_pay_bill,

@@ -6,6 +6,7 @@
 #   parse_request → lookup → respond        (대상이 불명확하면 ask_user → lookup)
 #                 → resolve → ask_user → resolve
 #                           → create_request → confirm → execute → next_task → respond
+#                                                                (조건부 이체 금액 변동) → confirm
 #                                                      → (거절) next_task
 #                                                      → (수정) resolve
 #                                                      → (판단 불가) confirm
@@ -47,12 +48,17 @@ Intent = Literal[
     "query_cards", "report_lost", "lock_card", "unlock_card",
     "reissue_card", "lost_and_reissue", "query_reissue", "modify_reissue", "cancel_reissue",
     "query_bills", "pay_bill", "pay_bills_batch",
+    "query_transactions", "conditional_transfer", "multi_transfer", "rename_account",
     "unknown",
 ]
 
 INTENT_GUIDE = """\
 - query_accounts: 계좌 목록·잔액·총액 질문
-- transfer: 내 계좌 간 이체 요청
+- transfer: 내 계좌 간 이체 요청 (금액을 직접 지정, 입금 계좌 1개)
+- conditional_transfer: 출금 계좌에 일정 금액을 남기고 나머지를 이체 (예: 40만 원 남기고 나머지 저축해줘)
+- multi_transfer: 한 출금 계좌에서 여러 입금 계좌로 각각 금액을 정해 이체
+- rename_account: 계좌 별명(이름) 변경
+- query_transactions: 거래 내역 조회 (입금·출금·결제 내역, 기간·금액 조건)
 - query_cards: 카드 목록·상태 질문
 - report_lost: 카드를 잃어버렸거나 도난당해 정지 요청 (되돌릴 수 없음)
 - lock_card: 카드를 잠깐 못 쓰게 잠그는 요청 (집에 두고 옴, 잠시 보관 등)
@@ -68,6 +74,11 @@ INTENT_GUIDE = """\
 - unknown: 그 외 또는 판단 불가"""
 
 
+class TransferItem(BaseModel):
+    to_account: str | None = Field(None, description="입금 계좌 별명")
+    amount: int | None = Field(None, description="원 단위 정수")
+
+
 class Slots(BaseModel):
     """업무별 슬롯. 필드 이름은 functions.TASKS의 Task.slots와 같다."""
     from_account: str | None = Field(None, description="출금 계좌 별명. 언급이 없으면 null")
@@ -79,23 +90,53 @@ class Slots(BaseModel):
     bill: str | None = Field(None, description="납부할 청구서 하나의 이름 (예: 전기요금). 언급이 없으면 null")
     bills: list[str] | None = Field(None, description="일괄 납부할 청구서 이름 목록. 언급이 없으면 null")
     all_bills: bool | None = Field(None, description="미납 청구서 '전부'를 납부하라는 요청이면 true")
+    keep_amount: int | None = Field(None, description="조건부 이체에서 출금 계좌에 남길 금액 (원 단위 정수)")
+    transfers: list[TransferItem] | None = Field(None, description="여러 계좌 이체의 (입금 계좌, 금액) 목록")
+    account: str | None = Field(None, description="별명을 바꾸거나 거래 내역을 볼 대상 계좌 별명")
+    new_nickname: str | None = Field(None, description="새 계좌 별명. 사용자가 말한 그대로")
+    period: Literal["today", "this_week", "last_week", "this_month", "last_month", "custom", "all"] | None = Field(
+        None, description="거래 조회 기간. 날짜를 직접 말하면 custom, 기간 언급이 없으면 null"
+    )
+    start_date: str | None = Field(None, description="custom 기간의 시작일 YYYY-MM-DD")
+    end_date: str | None = Field(None, description="custom 기간의 종료일 YYYY-MM-DD")
+    min_amount: int | None = Field(None, description="거래 금액 하한 (예: 5만 원 이상 → 50000)")
+    max_amount: int | None = Field(None, description="거래 금액 상한")
+    tx_type: Literal["deposit", "withdrawal", "card_payment"] | None = Field(
+        None, description="deposit: 입금 / withdrawal: 출금(카드 결제 포함) / card_payment: 카드로 결제한 지출"
+    )
 
 
-class ParsedRequest(Slots):
+# 판단 필드(intent, decision 등)는 슬롯보다 앞에 둔다. 뒤에 두면 모델이 슬롯을 모두 null로
+# 채우는 경우가 있었다 (같은 요청 30회 중 5회 → 앞에 두니 0회). 다중 상속 시 뒤쪽 부모의
+# 필드가 먼저 오므로 (Slots, 판단 필드) 순서로 상속한다.
+
+class _RequestHead(BaseModel):
     intent: Intent = Field(description=INTENT_GUIDE)
     reason: str = Field(description="분류 근거 한 문장")
 
 
-class SlotAnswer(Slots):
+class ParsedRequest(Slots, _RequestHead):
+    pass
+
+
+class _AnswerHead(BaseModel):
     cancel: bool = Field(description="사용자가 요청을 그만두겠다고 하면 true")
     selected_id: str | None = Field(None, description="후보 목록에서 고른 항목의 id")
 
 
-class ApprovalReply(Slots):
+class SlotAnswer(Slots, _AnswerHead):
+    pass
+
+
+class _ApprovalHead(BaseModel):
     decision: Literal["approve", "reject", "modify", "unclear"] = Field(description=(
         "approve: 진행 동의 / reject: 취소·거절 / "
         "modify: 처리안 일부를 바꿔 달라는 요청 (바뀐 값만 채움) / unclear: 판단 불가"
     ))
+
+
+class ApprovalReply(Slots, _ApprovalHead):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +202,14 @@ def _user_context(user_id: str) -> str:
 
 
 def _pick_slots(model: BaseModel, intent: str) -> dict:
-    """LLM 출력에서 현재 업무가 쓰는 슬롯만 꺼낸다."""
-    return {name: getattr(model, name) for name in fn.TASKS[intent].slots}
+    """LLM 출력에서 현재 업무가 쓰는 슬롯만 꺼낸다. 목록 안의 모델은 dict로 바꿔 State에 저장한다."""
+    def plain(value):
+        if isinstance(value, BaseModel):
+            return value.model_dump()
+        if isinstance(value, list):
+            return [plain(v) for v in value]
+        return value
+    return {name: plain(getattr(model, name)) for name in fn.TASKS[intent].slots}
 
 
 def _merge_slots(slots: dict, changes: dict) -> dict:
@@ -329,7 +376,8 @@ def confirm(state: BankState) -> dict:
     messages = [AIMessage(shown), HumanMessage(answer)]
     prompt = (
         "은행 앱이 아래 처리안의 승인 여부를 물었고, 사용자가 답했습니다. 답변을 분류하세요.\n"
-        "modify라면 바뀐 값만 채우고, 나머지는 null로 두세요.\n\n"
+        "modify라면 바뀐 값만 채우고, 나머지는 null로 두세요. "
+        "단, 목록 값(transfers, bills)이 바뀌면 바뀐 뒤의 전체 목록을 채우세요.\n\n"
         f"처리안:\n{state['plan']}\n\n사용자 답변: {answer}"
     )
     try:
@@ -366,10 +414,23 @@ def confirm(state: BankState) -> dict:
 def execute(state: BankState) -> dict:
     task = fn.TASKS[state["intent"]]
     result = task.execute(state["user_id"], state["request_id"])
+    if result["status"] == "changed":
+        # 조건부 이체: 승인 후 잔액이 바뀌어 이체액이 달라짐 → 새 처리안으로 다시 승인받는다.
+        try:
+            fn.update_request_params(state["request_id"], result["draft"])
+        except SaveError as e:
+            return {"step": "done", "result": {"status": "failed", "message": str(e)},
+                    **_stop_queue(state, f"처리안을 갱신하지 못해 진행하지 않았어요. ({e})")}
+        return {
+            "step": "changed",
+            "draft": result["draft"],
+            "plan": task.describe(state["user_id"], result["draft"]),
+            "notice": result["message"],
+        }
     if result["status"] == "completed":
-        return {"result": result, "log": _log(state, result["message"])}
+        return {"step": "done", "result": result, "log": _log(state, result["message"])}
     # 실행에 실패하면 뒤 단계는 진행하지 않는다.
-    return {"result": result, **_stop_queue(state, result["message"])}
+    return {"step": "done", "result": result, **_stop_queue(state, result["message"])}
 
 
 def next_task(state: BankState) -> dict:
@@ -454,6 +515,21 @@ def _format_response(state: BankState) -> str:
             f"재발급 신청 {a['application_id']}\n- 카드: {a['card']}\n- 배송지: {a['address']}\n"
             f"- 상태: {a['status']}\n- 신청일: {a['created_at']}"
         )
+    if intent == "query_transactions":
+        rows = result["transactions"]
+        if not rows:
+            return f"조건({result['filters']})에 맞는 거래가 없어요."
+        lines = []
+        for r in rows:
+            detail = " · ".join(filter(None, [r["merchant"], r["card"]]))
+            lines.append(
+                f"- {r['occurred_at']} {r['account']} {r['type']} {fn.won(r['amount'])}"
+                + (f" ({detail})" if detail else "")
+            )
+        return (
+            f"거래 내역 {len(rows)}건이에요. ({result['filters']}, 최근순)\n" + "\n".join(lines)
+            + f"\n입금 합계 {fn.won(result['deposit_total'])} · 출금 합계 {fn.won(result['withdrawal_total'])}"
+        )
     if intent == "query_bills":
         if not result["bills"]:
             return "미납 청구서가 없어요."
@@ -465,7 +541,7 @@ def _format_response(state: BankState) -> str:
     if intent in fn.TASKS and result.get("message"):
         return result["message"]
     return (
-        "지금은 계좌 조회·이체, 카드 조회·분실 정지·잠금·해제, 카드 재발급 신청·조회·변경·취소, 청구서 조회·납부를 도와드릴 수 있어요.\n"
+        "지금은 계좌 조회·이체, 카드 조회·분실 정지·잠금·해제, 카드 재발급 신청·조회·변경·취소, 청구서 조회·납부, 거래 내역 조회, 조건부·여러 계좌 이체, 계좌 별명 변경을 도와드릴 수 있어요.\n"
         "예: '내 계좌 잔액 보여줘', '생활비에서 저축으로 10만 원 옮겨줘', '생활비 카드 잃어버렸어. 정지하고 재발급해줘'"
     )
 
@@ -509,6 +585,10 @@ def route_after_confirm(state: BankState) -> str:
     }.get(state["decision"], "confirm")
 
 
+def route_after_execute(state: BankState) -> str:
+    return "confirm" if state.get("step") == "changed" else "next_task"
+
+
 def route_after_next(state: BankState) -> str:
     return "resolve" if state["step"] == "next" else "respond"
 
@@ -533,7 +613,7 @@ def build_graph(checkpointer=None):
     builder.add_conditional_edges("ask_user", route_after_ask, ["lookup", "resolve", "respond"])
     builder.add_conditional_edges("create_request", route_after_create, ["confirm", "respond"])
     builder.add_conditional_edges("confirm", route_after_confirm, ["execute", "next_task", "resolve", "confirm"])
-    builder.add_edge("execute", "next_task")
+    builder.add_conditional_edges("execute", route_after_execute, ["confirm", "next_task"])
     builder.add_conditional_edges("next_task", route_after_next, ["resolve", "respond"])
     builder.add_edge("respond", END)
     return builder.compile(checkpointer=checkpointer)
